@@ -1,0 +1,31 @@
+[package]
+name = "chimera_voice"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Chimera Voice: the CHIMERA physical-modelling voice engine as a CLAP instrument"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[[bin]]
+name = "chimera_voice_standalone"
+path = "src/main.rs"
+
+[dependencies]
+nih_plug = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683", features = ["standalone"] }
+nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de421011f41a6d10fc8c7a6084e4f4dee0143683" }
+chimera = { path = "vendor/chimera-vocal-synth/crates/chimera" }
+flate2 = "1"
+parking_lot = "0.12"
+
+[profile.release]
+opt-level = 3
+codegen-units = 1
+lto = "fat"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package.chimera]
+opt-level = 3

@@ -1,0 +1,3 @@
+[submodule "vendor/chimera-vocal-synth"]
+	path = vendor/chimera-vocal-synth
+	url = https://github.com/jamesondh/chimera-vocal-synth
