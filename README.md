@@ -9,29 +9,77 @@ the plugin around it: note handling, parameters and the editor.
 
 ## Playing it
 
-It is one voice (monophonic).
+It is one voice (monophonic), with four modes.
 
-- **Sing lyrics**: type words; each note sings the next syllable. Overlap two notes to sing them
-  legato. A lone `-` in the lyrics holds the vowel onto the next note. A typed hyphen splits a word
-  yourself (`ti-ger`). Commas, full stops and line breaks end a phrase. Click a syllable to start
-  from it. English uses the CMU Pronouncing Dictionary; Korean (Hangul) and Russian also work.
-- **Vowel pad**: notes sing the vowel under the pad's handle; drag it (or automate *Vowel
-  Front-Back* / *Vowel Close-Open*) to move the mouth.
+### Sing
+
+Each note sings the next syllable of the lyrics. Overlap two notes to sing them legato. Click a
+syllable to start from it. **Restart when play starts** sends the lyrics back to the first
+syllable each time the transport starts.
+
+Ways to get lyrics in:
+
+- **Type** in the box. English uses the CMU Pronouncing Dictionary; Korean (Hangul) and Russian
+  also work.
+- **Paste** takes the clipboard's text; **Load file** reads a text file. Both work even where the
+  host keeps keystrokes from the plugin window.
+- **Eight phrases** (the numbered buttons), saved with the project. Pick the one to sing by
+  clicking, by automating *Phrase*, or by playing a keyswitch: C0 to G0 (MIDI notes 24 to 31)
+  pick phrases 1 to 8 and start them from the top.
+- **Sounds instead of spelling**, for invented words or exact pronunciation:
+  - `{HH AH L OW / W ER L D}` uses the dictionary's sound codes; a `/` starts the next word.
+    **Help** lists the codes.
+  - `[həloʊ wɝld]` uses phonetic symbols (IPA); spaces separate words.
+  - A sound the voice cannot make is named in red under the lyrics.
+
+In any of them: a lone `-` holds the vowel onto the next note, a typed hyphen splits a word
+yourself (`ti-ger`), and commas, full stops and line breaks end a phrase (the singer breathes).
+
+### Vowel
+
+Notes sing the vowel under the pad's handle; drag it (or automate *Vowel Front-Back* / *Vowel
+Close-Open*) to move the mouth.
+
+### Creature
+
+A songbird, a Weddell seal, an alligator or an elephant, each with its own airway and knobs.
+**The keys play** either a held note (the creature breathes at the key's pitch until you let go)
+or one of its calls (each key plays the whole call at that pitch). The keyboard is moved by octaves
+to sit in the creature's range. The eight *Creature Knob* parameters are whatever the chosen
+creature's knobs are.
+
+### Beatbox
+
+The keys from C1 play the mouth's drum sounds, laid out like a General MIDI kit:
+
+| Key | Sound | Key | Sound |
+|---|---|---|---|
+| C1 | Kick | F#1, G#1 | Hi-hat |
+| C#1 | Rimshot | A#1 | Open hat |
+| D1 | Snare | B1 | Crash |
+| E1 | Inward snare | D#1, A1 | Lip pop |
+| F1, G1 | Tongue click | any other key | Hum (a held bass note) |
+
+Click a pad to hear it.
+
+### Everywhere
+
 - **Body**: man, woman, child, or anywhere between. **Octave** shifts the keyboard.
 - **Voice knobs**: Breath (lung pressure), Pressed, Bright, Breathy, Rough, Fry, Whisper.
 - **Pitch knobs**: Vibrato depth and rate, Glide, Drift (human pitch wander), Bend range.
 - Velocity sets how hard the voice breathes. Pitch bend, mod wheel (more vibrato) and the sustain
   pedal work. **Silence** stops everything.
-- **Restart when play starts** sends the lyrics back to the first syllable each time the
-  transport starts.
-- **Eco** halves the processor use for a slightly duller voice.
+- **Eco** halves the human voice's processor use for a slightly duller sound.
 
 Knobs: drag up and down, hold Shift for fine steps, double-click for the default.
+
+Changing the body, the creature, Eco, or going into or out of Creature mode builds a new airway in
+the background; the voice is silent for about a third of a second while it does.
 
 ## Processor use
 
 The airway simulation is heavy: about 60% of one performance core of an i7-13700H at 48 kHz, 28%
-with Eco on. Use one instance per singing part and bounce or freeze tracks when a project grows.
+with Eco on. Use one instance per part and bounce or freeze tracks when a project grows.
 
 ## Building
 
@@ -40,7 +88,7 @@ Needs Rust (`rustup`, stable, MSVC toolchain).
 ```
 git submodule update --init
 ./install.ps1        # builds and copies "Chimera Voice.clap" to %LOCALAPPDATA%\Programs\Common\CLAP
-cargo test --release # sings test phrases; WAVs land in target/renders
+cargo test --release # plays test phrases, creatures and drums; WAVs land in target/renders
 ```
 
 `target/release/chimera_voice_standalone.exe` runs the plugin on its own with the system's audio
@@ -48,11 +96,11 @@ and MIDI devices.
 
 ## Layout
 
-- `src/performer.rs`: notes → engine commands (a port of the web app's live Sing controller, plus
-  the vowel pad). No plugin code: the tests drive it directly.
+- `src/performer.rs`: notes → engine commands for the four modes (Sing is a port of the web app's
+  live Sing controller). No plugin code: the tests drive it directly.
+- `src/lyrics.rs`: text → syllables (words, sound codes, IPA), with the dictionary built in.
 - `src/lib.rs`: the plugin (parameters, MIDI, audio callback).
 - `src/editor.rs`: the editor (egui).
-- `src/lyrics.rs`: text → syllables, with the dictionary built in.
 - `src/shared.rs`: what the audio thread, the editor and the background task share.
 
 ## Licences
@@ -62,4 +110,6 @@ This project is MIT-licensed (see `LICENSE`). It builds on:
 - CHIMERA, © 2026 Jameson Hodge, MIT (`vendor/chimera-vocal-synth/LICENSE`).
 - The CMU Pronouncing Dictionary (`vendor/chimera-vocal-synth/public/data/CMUDICT-LICENSE.txt`).
 - AVHershey Simplex by Stewart C. Russell, CC0 / WTFPL.
-- [NIH-plug](https://github.com/robbert-vdh/nih-plug), ISC, and [egui](https://github.com/emilk/egui), MIT / Apache-2.0.
+- [NIH-plug](https://github.com/robbert-vdh/nih-plug), ISC; [egui](https://github.com/emilk/egui),
+  [copypasta](https://github.com/alacritty/copypasta) and [rfd](https://github.com/PolyMeilex/rfd),
+  MIT / Apache-2.0.

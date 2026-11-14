@@ -2,7 +2,6 @@
 //! MIT, © Jameson Hodge) as a monophonic CLAP instrument.
 
 use chimera::anatomy::human::BodyMix;
-use chimera::engine::Engine;
 use chimera::voice::human_voice::VoiceTelemetry;
 use nih_plug::prelude::*;
 use nih_plug_egui::EguiState;
@@ -15,8 +14,8 @@ pub mod lyrics;
 pub mod performer;
 pub mod shared;
 
-use performer::{Mode, Performer, Tone};
-use shared::{Shared, SCOPE_LEN};
+use performer::{Built, KeyAction, Mode, Performer, Tone, CREATURE_KNOBS, PHRASES};
+use shared::{Shared, VoiceSpec, SCOPE_LEN, TUBES, TUBE_POINTS};
 
 pub const DEFAULT_LYRICS: &str = "Hello there, I am a voice made of air.";
 
@@ -28,6 +27,64 @@ pub enum ModeParam {
     #[id = "vowel"]
     #[name = "Vowel pad"]
     Vowel,
+    #[id = "creature"]
+    #[name = "Creature"]
+    Creature,
+    #[id = "beatbox"]
+    #[name = "Beatbox"]
+    Beatbox,
+}
+
+#[derive(Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreatureParam {
+    #[id = "songbird"]
+    Songbird,
+    #[id = "seal"]
+    Seal,
+    #[id = "alligator"]
+    Alligator,
+    #[id = "elephant"]
+    Elephant,
+}
+
+impl CreatureParam {
+    pub const ALL: [CreatureParam; 4] = [CreatureParam::Songbird, CreatureParam::Seal, CreatureParam::Alligator, CreatureParam::Elephant];
+    /// Its index in the engine's bestiary.
+    pub fn index(self) -> usize {
+        self as usize
+    }
+}
+
+#[derive(Enum, Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeysParam {
+    #[id = "hold"]
+    #[name = "Held note"]
+    Hold,
+    #[id = "call1"]
+    #[name = "Call 1"]
+    Call1,
+    #[id = "call2"]
+    #[name = "Call 2"]
+    Call2,
+    #[id = "call3"]
+    #[name = "Call 3"]
+    Call3,
+    #[id = "call4"]
+    #[name = "Call 4"]
+    Call4,
+}
+
+impl KeysParam {
+    pub const CALLS: [KeysParam; 4] = [KeysParam::Call1, KeysParam::Call2, KeysParam::Call3, KeysParam::Call4];
+    fn action(self) -> KeyAction {
+        match self {
+            KeysParam::Hold => KeyAction::Hold,
+            KeysParam::Call1 => KeyAction::Call(0),
+            KeysParam::Call2 => KeyAction::Call(1),
+            KeysParam::Call3 => KeyAction::Call(2),
+            KeysParam::Call4 => KeyAction::Call(3),
+        }
+    }
 }
 
 /// The body slider: 0 adult male, 1 adult female, 2 child, blending in between.
@@ -59,8 +116,9 @@ fn body_name(v: f32) -> String {
 pub struct ChimeraParams {
     #[persist = "editor-state"]
     pub editor_state: Arc<EguiState>,
-    #[persist = "lyrics"]
-    pub lyrics: Arc<RwLock<String>>,
+    /// the eight phrases of lyrics
+    #[persist = "phrases"]
+    pub phrases: Arc<RwLock<Vec<String>>>,
 
     #[id = "mode"]
     pub mode: EnumParam<ModeParam>,
@@ -68,6 +126,8 @@ pub struct ChimeraParams {
     pub body: FloatParam,
     #[id = "octave"]
     pub octave: IntParam,
+    #[id = "phrase"]
+    pub phrase: IntParam,
 
     #[id = "breath"]
     pub breath: FloatParam,
@@ -100,12 +160,26 @@ pub struct ChimeraParams {
     #[id = "vowely"]
     pub vowel_y: FloatParam,
 
+    #[id = "creature"]
+    pub creature: EnumParam<CreatureParam>,
+    #[id = "keys"]
+    pub keys: EnumParam<KeysParam>,
+    /// the creature's knobs: what each one does depends on the creature
+    #[nested(array, group = "Creature")]
+    pub knobs: [KnobParam; CREATURE_KNOBS],
+
     #[id = "eco"]
     pub eco: BoolParam,
     #[id = "restart"]
     pub restart_on_play: BoolParam,
     #[id = "gain"]
     pub gain: FloatParam,
+}
+
+#[derive(Params)]
+pub struct KnobParam {
+    #[id = "knob"]
+    pub value: FloatParam,
 }
 
 fn percent(name: &str, default: f32) -> FloatParam {
@@ -117,9 +191,12 @@ fn percent(name: &str, default: f32) -> FloatParam {
 
 impl Default for ChimeraParams {
     fn default() -> Self {
+        let mut phrases = vec![String::new(); PHRASES];
+        phrases[0] = DEFAULT_LYRICS.to_string();
+        let knob_defaults = performer::creature_defaults(performer::creature(0));
         Self {
             editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
-            lyrics: Arc::new(RwLock::new(DEFAULT_LYRICS.to_string())),
+            phrases: Arc::new(RwLock::new(phrases)),
 
             mode: EnumParam::new("Mode", ModeParam::Sing),
             body: FloatParam::new("Body", 0.0, FloatRange::Linear { min: 0.0, max: 2.0 })
@@ -134,6 +211,7 @@ impl Default for ChimeraParams {
                     }
                 })),
             octave: IntParam::new("Octave", 0, IntRange::Linear { min: -3, max: 3 }),
+            phrase: IntParam::new("Phrase", 1, IntRange::Linear { min: 1, max: PHRASES as i32 }),
 
             breath: FloatParam::new("Breath", 8.0, FloatRange::Linear { min: 2.0, max: 22.0 })
                 .with_unit(" cmH2O")
@@ -164,6 +242,10 @@ impl Default for ChimeraParams {
             vowel_y: FloatParam::new("Vowel Close-Open", 1.0, FloatRange::Linear { min: 0.0, max: 1.0 })
                 .with_value_to_string(formatters::v2s_f32_rounded(2)),
 
+            creature: EnumParam::new("Creature", CreatureParam::Songbird).non_automatable(),
+            keys: EnumParam::new("Creature Keys Play", KeysParam::Hold),
+            knobs: std::array::from_fn(|i| KnobParam { value: percent(&format!("Creature Knob {}", i + 1), knob_defaults[i] as f32) }),
+
             eco: BoolParam::new("Eco Quality", false).non_automatable(),
             restart_on_play: BoolParam::new("Restart Lyrics On Play", true),
             gain: FloatParam::new("Volume", 0.0, FloatRange::Linear { min: -30.0, max: 12.0 })
@@ -174,9 +256,17 @@ impl Default for ChimeraParams {
     }
 }
 
+impl ChimeraParams {
+    /// Every phrase's syllables, as the audio thread wants them.
+    pub fn parse_phrases(&self) -> Vec<Vec<chimera::phonetics::Syllable>> {
+        let phrases = self.phrases.read();
+        (0..PHRASES).map(|i| phrases.get(i).map_or_else(Vec::new, |t| lyrics::parse(t))).collect()
+    }
+}
+
 pub enum Task {
-    /// build an engine for this body, off the audio thread
-    BuildEngine { sample_rate: f64, body: BodyMix, eco: bool },
+    /// build an engine, off the audio thread
+    Build { sample_rate: f64, spec: VoiceSpec },
 }
 
 pub struct ChimeraVoice {
@@ -189,19 +279,21 @@ pub struct ChimeraVoice {
     tele_wait: usize,
     scope: [f32; SCOPE_LEN],
     scope_pos: usize,
-    /// the voice (body, eco) last asked for, and for how many samples that has stood still
-    body_seen: (BodyMix, bool),
-    body_still: usize,
+    /// the voice last asked for, and for how many samples that has stood still
+    spec_seen: VoiceSpec,
+    spec_still: usize,
     /// the voice the engine is running, and whether another is being built in the background
-    voice_now: (BodyMix, bool),
-    body_building: bool,
+    spec_now: VoiceSpec,
+    building: bool,
     was_playing: bool,
+    phrase_seen: i32,
     bend: f64,
     mod_wheel: f64,
 }
 
 impl Default for ChimeraVoice {
     fn default() -> Self {
+        let spec = (BodyMix::MALE, false, None);
         Self {
             params: Arc::new(ChimeraParams::default()),
             shared: Arc::new(Shared::new()),
@@ -212,11 +304,12 @@ impl Default for ChimeraVoice {
             tele_wait: 0,
             scope: [0.0; SCOPE_LEN],
             scope_pos: 0,
-            body_seen: (BodyMix::MALE, false),
-            body_still: 0,
-            voice_now: (BodyMix::MALE, false),
-            body_building: false,
+            spec_seen: spec,
+            spec_still: 0,
+            spec_now: spec,
+            building: false,
             was_playing: false,
+            phrase_seen: 1,
             bend: 0.0,
             mod_wheel: 0.0,
         }
@@ -239,6 +332,12 @@ impl ChimeraVoice {
             drift: p.drift.value() as f64,
             whisper: p.whisper.value(),
         }
+    }
+
+    /// The voice the parameters ask for.
+    fn spec(&self) -> VoiceSpec {
+        let creature = (self.params.mode.value() == ModeParam::Creature).then(|| self.params.creature.value().index());
+        (body_for(self.params.body.value()), self.params.eco.value(), creature)
     }
 
     fn handle_event(&mut self, event: PluginNoteEvent<Self>) {
@@ -286,11 +385,11 @@ impl Plugin for ChimeraVoice {
     fn task_executor(&mut self) -> TaskExecutor<Self> {
         let shared = self.shared.clone();
         Box::new(move |task| match task {
-            Task::BuildEngine { sample_rate, body, eco } => {
-                let engine: Engine = Performer::build_engine(sample_rate, body, eco);
+            Task::Build { sample_rate, spec } => {
+                let built = Built::new(sample_rate, spec.0, spec.1, spec.2);
                 let mut b = shared.engine_box.lock();
                 b.outgoing = None;
-                b.incoming = Some((body, eco, engine));
+                b.incoming = Some((spec, built));
                 drop(b);
                 shared.engine_ready.store(true, Ordering::Release);
             }
@@ -303,21 +402,21 @@ impl Plugin for ChimeraVoice {
 
     fn initialize(&mut self, _layout: &AudioIOLayout, config: &BufferConfig, _context: &mut impl InitContext<Self>) -> bool {
         self.sample_rate = config.sample_rate as f64;
-        let body = body_for(self.params.body.value());
-        let eco = self.params.eco.value();
-        let mut perf = Performer::with_engine(Performer::build_engine(self.sample_rate, body, eco), body);
-        let syllables = lyrics::parse(&self.params.lyrics.read());
-        *self.shared.chips.lock() = syllables.iter().map(lyrics::written).collect();
-        self.shared.chips_version.fetch_add(1, Ordering::Relaxed);
-        perf.set_lyrics(syllables);
+        let spec = self.spec();
+        let mut perf = Performer::with(Built::new(self.sample_rate, spec.0, spec.1, spec.2));
+        self.params.phrases.write().resize(PHRASES, String::new());
+        perf.set_phrases(self.params.parse_phrases());
+        self.phrase_seen = self.params.phrase.value();
+        perf.select_phrase((self.phrase_seen - 1).max(0) as usize);
+        self.shared.state_version.fetch_add(1, Ordering::Relaxed);
         // a first snapshot sizes the telemetry's buffers, so the audio thread never grows them
         perf.telemetry(&mut self.tele);
         self.performer = Some(perf);
         self.mono = vec![0.0; (config.max_buffer_size as usize).max(64)];
-        self.body_seen = (body, eco);
-        self.voice_now = (body, eco);
-        self.body_still = 0;
-        self.body_building = false;
+        self.spec_seen = spec;
+        self.spec_now = spec;
+        self.spec_still = 0;
+        self.building = false;
         self.bend = 0.0;
         self.mod_wheel = 0.0;
         // nothing older may arrive after this
@@ -345,6 +444,7 @@ impl Plugin for ChimeraVoice {
         let tone = self.tone();
         let shared = self.shared.clone();
         let playing = context.transport().playing;
+        let want = self.spec();
 
         // ---- what the editor and the background task sent
         {
@@ -352,27 +452,60 @@ impl Plugin for ChimeraVoice {
             if shared.lyrics_ready.load(Ordering::Acquire) {
                 if let Some(mut b) = shared.lyrics_box.try_lock() {
                     if let Some(new) = b.incoming.take() {
-                        b.outgoing = Some(perf.set_lyrics(new));
+                        let cursor = perf.cursor();
+                        b.outgoing = Some(perf.set_phrases(new));
+                        perf.set_cursor(cursor); // typing does not send the singer back to the start
                     }
                     shared.lyrics_ready.store(false, Ordering::Release);
                 }
             }
             if shared.engine_ready.load(Ordering::Acquire) {
                 if let Some(mut b) = shared.engine_box.try_lock() {
-                    if let Some((body, eco, engine)) = b.incoming.take() {
+                    if let Some((spec, built)) = b.incoming.take() {
                         let cursor = perf.cursor();
-                        let old = perf.swap_engine(engine, body);
+                        let old = perf.swap(built);
                         perf.set_cursor(cursor);
-                        b.outgoing = Some((body, eco, old));
-                        self.voice_now = (body, eco);
+                        b.outgoing = Some((self.spec_now, old));
+                        self.spec_now = spec;
                     }
                     shared.engine_ready.store(false, Ordering::Release);
-                    self.body_building = false;
+                    self.building = false;
                 }
+            }
+
+            perf.set_mode(match self.params.mode.value() {
+                ModeParam::Sing => Mode::Sing,
+                ModeParam::Vowel => Mode::Vowel,
+                ModeParam::Creature => Mode::Creature,
+                ModeParam::Beatbox => Mode::Beatbox,
+            });
+            perf.set_tone(&tone);
+            perf.set_transpose(12.0 * self.params.octave.value() as f64);
+            perf.set_pad(self.params.vowel_x.value() as f64, self.params.vowel_y.value() as f64);
+            perf.set_key_action(self.params.keys.value().action());
+            let mut knobs = [0.0; CREATURE_KNOBS];
+            for (k, p) in knobs.iter_mut().zip(self.params.knobs.iter()) {
+                *k = p.value.value() as f64;
+            }
+            perf.set_knobs(&knobs);
+
+            // the phrase: the parameter (when it moves), the editor, or a keyswitch
+            let phrase = self.params.phrase.value();
+            if phrase != self.phrase_seen {
+                self.phrase_seen = phrase;
+                perf.select_phrase((phrase - 1).max(0) as usize);
+            }
+            let req = shared.phrase_request.swap(-1, Ordering::AcqRel);
+            if req >= 0 {
+                perf.select_phrase(req as usize);
             }
             let req = shared.cursor_request.swap(-1, Ordering::AcqRel);
             if req >= 0 {
                 perf.set_cursor(req as usize);
+            }
+            let req = shared.beat_request.swap(-1, Ordering::AcqRel);
+            if req >= 0 {
+                perf.beat(req as usize, 0.75);
             }
             if shared.panic.swap(false, Ordering::AcqRel) {
                 perf.all_notes_off();
@@ -381,27 +514,18 @@ impl Plugin for ChimeraVoice {
                 perf.set_cursor(0);
             }
             self.was_playing = playing;
-
-            perf.set_mode(match self.params.mode.value() {
-                ModeParam::Sing => Mode::Sing,
-                ModeParam::Vowel => Mode::Vowel,
-            });
-            perf.set_tone(&tone);
-            perf.set_transpose(12.0 * self.params.octave.value() as f64);
-            perf.set_pad(self.params.vowel_x.value() as f64, self.params.vowel_y.value() as f64);
         }
 
-        // ---- the body: built in the background once the slider has stood still for a moment
-        let want = (body_for(self.params.body.value()), self.params.eco.value());
-        if want != self.body_seen {
-            self.body_seen = want;
-            self.body_still = 0;
+        // ---- the voice: built in the background once what is asked for has stood still a moment
+        if want != self.spec_seen {
+            self.spec_seen = want;
+            self.spec_still = 0;
         } else {
-            self.body_still = self.body_still.saturating_add(n);
+            self.spec_still = self.spec_still.saturating_add(n);
         }
-        if want != self.voice_now && !self.body_building && self.body_still as f64 > 0.12 * self.sample_rate {
-            self.body_building = true;
-            context.execute_background(Task::BuildEngine { sample_rate: self.sample_rate, body: want.0, eco: want.1 });
+        if want != self.spec_now && !self.building && self.spec_still as f64 > 0.12 * self.sample_rate {
+            self.building = true;
+            context.execute_background(Task::Build { sample_rate: self.sample_rate, spec: want });
         }
 
         // ---- audio, split at each event so notes land on their sample
@@ -445,30 +569,56 @@ impl Plugin for ChimeraVoice {
 
         // ---- what the editor shows
         let perf = self.performer.as_mut().unwrap();
+        shared.phrase.store(perf.phrase() as i64, Ordering::Relaxed);
         shared.cursor.store(perf.cursor() as i64, Ordering::Relaxed);
         shared.sounding.store(perf.sounding_index().map_or(-1, |i| i as i64), Ordering::Relaxed);
+        let (beat, count) = perf.last_beat();
+        shared.beat_last.store(beat as u32, Ordering::Relaxed);
+        shared.beat_count.store(count, Ordering::Relaxed);
         self.tele_wait += n;
         if self.params.editor_state.is_open() && self.tele_wait as f64 >= self.sample_rate / 60.0 {
             if let Some(mut viz) = shared.viz.try_lock() {
                 self.tele_wait = 0;
-                perf.telemetry(&mut self.tele);
-                for (d, s) in viz.artic.iter_mut().zip(self.tele.artic.iter()) {
-                    *d = *s;
-                }
                 viz.body = perf.body();
-                viz.f0 = self.tele.f0 as f32;
-                viz.voicing = self.tele.voicing as f32;
-                viz.level = self.tele.out_rms as f32;
                 for k in 0..SCOPE_LEN {
                     viz.scope[k] = self.scope[(self.scope_pos + k) % SCOPE_LEN];
                 }
                 viz.active.clear();
-                for l in &self.tele.active {
-                    if viz.active.len() + l.as_str().len() + 1 <= viz.active.capacity() {
-                        if !viz.active.is_empty() {
-                            viz.active.push(' ');
+                if let Some(t) = perf.creature_telemetry() {
+                    viz.creature = t.id;
+                    viz.call = t.call;
+                    viz.gate = t.gate as f32;
+                    viz.level = t.out_rms as f32;
+                    viz.f0 = 0.0;
+                    viz.voicing = 0.0;
+                    viz.tube_count = t.tubes.len().min(TUBES);
+                    for (d, s) in viz.tubes.iter_mut().zip(t.tubes.iter()) {
+                        d.name = s.name;
+                        let m = s.areas.len();
+                        for k in 0..TUBE_POINTS {
+                            let i = if m == 0 { 0 } else { (k * m / TUBE_POINTS).min(m - 1) };
+                            d.areas[k] = s.areas.get(i).copied().unwrap_or(0.0);
+                            d.rms[k] = s.rms.get(i).copied().unwrap_or(0.0);
                         }
-                        viz.active.push_str(l.as_str());
+                    }
+                } else {
+                    perf.telemetry(&mut self.tele);
+                    viz.creature = "";
+                    viz.call = None;
+                    for (d, s) in viz.artic.iter_mut().zip(self.tele.artic.iter()) {
+                        *d = *s;
+                    }
+                    viz.f0 = self.tele.f0 as f32;
+                    viz.voicing = self.tele.voicing as f32;
+                    viz.level = self.tele.out_rms as f32;
+                    viz.gate = self.tele.gate as f32;
+                    for l in &self.tele.active {
+                        if viz.active.len() + l.as_str().len() + 1 <= viz.active.capacity() {
+                            if !viz.active.is_empty() {
+                                viz.active.push(' ');
+                            }
+                            viz.active.push_str(l.as_str());
+                        }
                     }
                 }
             }
@@ -480,7 +630,7 @@ impl Plugin for ChimeraVoice {
 
 impl ClapPlugin for ChimeraVoice {
     const CLAP_ID: &'static str = "com.chimera-voice.chimera-voice";
-    const CLAP_DESCRIPTION: Option<&'static str> = Some("A physically modelled singing voice: type lyrics, play notes");
+    const CLAP_DESCRIPTION: Option<&'static str> = Some("A physically modelled voice: sung lyrics, vowels, animal calls and beatbox");
     const CLAP_MANUAL_URL: Option<&'static str> = None;
     const CLAP_SUPPORT_URL: Option<&'static str> = None;
     const CLAP_FEATURES: &'static [ClapFeature] = &[ClapFeature::Instrument, ClapFeature::Synthesizer, ClapFeature::Stereo, ClapFeature::Mono];

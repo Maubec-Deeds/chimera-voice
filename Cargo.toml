@@ -18,6 +18,8 @@ nih_plug_egui = { git = "https://github.com/robbert-vdh/nih-plug.git", rev = "de
 chimera = { path = "vendor/chimera-vocal-synth/crates/chimera" }
 flate2 = "1"
 parking_lot = "0.12"
+copypasta = "0.10"
+rfd = "0.15"
 
 [profile.release]
 opt-level = 3

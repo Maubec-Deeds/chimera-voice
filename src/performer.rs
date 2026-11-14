@@ -4,15 +4,26 @@
 //! Sing mode is a port of the web app's live Sing controller (`src/ui/singing.ts` upstream): each
 //! key sings the next syllable of the lyrics at its pitch; overlapping keys sing legato; a lone
 //! `-` in the lyrics holds the vowel onto the next pitch (melisma); releasing the sounding key
-//! while another is still down glides back to that key.
+//! while another is still down glides back to that key. The lyrics are one of eight phrases; the
+//! keys C0 to G0 (MIDI 24 to 31) pick the phrase.
 //!
 //! Vowel mode plays the voice like a monosynth: the keys set pitch and breath, the pad sets the
 //! mouth's posture between the calibrated vowels.
+//!
+//! Creature mode plays one of the bestiary's animals: a held key breathes and sets its pitch, or
+//! each key triggers one of its calls at that pitch.
+//!
+//! Beatbox mode maps the keys C1 to B1 to the mouth's drum sounds; every other key hums a bass
+//! note.
 
 use chimera::anatomy::human::{ArticPatch, BodyMix};
-use chimera::control::score::ControlKey;
+use chimera::control::score::{ControlKey, Gesture, Label};
+use chimera::creatures::types::{CreatureDef, ParamDef, ParamRole};
+use chimera::creatures::voice::CreatureTelemetry;
+use chimera::creatures::CREATURES;
 use chimera::engine::{default_f0, Engine};
 use chimera::math::midi_to_hz;
+use chimera::phonetics::beatbox::{beat_ready, beat_sound, BeatBuild, BeatStep, BEAT_SOUNDS, MAX_SOUND_GESTURES};
 use chimera::phonetics::planner::{vowel_artic, EXHALE_LABEL};
 use chimera::phonetics::sing::{plan_melisma, plan_note_off, plan_note_on, LegatoFrom, MelismaOptions, NoteOnOptions};
 use chimera::phonetics::vowel_data::VOWELS;
@@ -25,6 +36,19 @@ pub enum Mode {
     Sing,
     /// keys sing the vowel under the pad's handle
     Vowel,
+    /// keys play an animal
+    Creature,
+    /// keys play the mouth's drum sounds
+    Beatbox,
+}
+
+/// What a key does in creature mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KeyAction {
+    /// the creature breathes while a key is down, at the key's pitch
+    Hold,
+    /// each key plays this call (an index into the creature's calls), at the key's pitch
+    Call(usize),
 }
 
 /// The voice's tone, as the knobs set it.
@@ -55,6 +79,8 @@ impl Default for Tone {
     }
 }
 
+// ---------------------------------------------------------------------- the vowel pad
+
 /// The vowels on the pad: one per position of the vowel chart.
 pub const PAD_VOWELS: [&str; 13] = ["i", "ɪ", "e", "ɛ", "æ", "a", "ɑ", "ɔ", "o", "ʊ", "u", "ʌ", "ə"];
 
@@ -75,6 +101,101 @@ pub fn nearest_pad_vowel(x: f64, y: f64) -> &'static str {
     }
     best.1
 }
+
+// ---------------------------------------------------------------------- phrases
+
+/// How many phrases the lyrics hold.
+pub const PHRASES: usize = 8;
+/// The key that picks the first phrase (C0 in Bitwig's naming); the next seven keys pick the rest.
+pub const PHRASE_KEY: u8 = 24;
+
+// ---------------------------------------------------------------------- creatures
+
+/// How many knobs a creature has at most (its parameters other than the pitch the keys set).
+pub const CREATURE_KNOBS: usize = 8;
+
+pub fn creature(index: usize) -> &'static CreatureDef {
+    &CREATURES[index.min(CREATURES.len() - 1)]
+}
+
+/// The creature's knobs: its parameters other than the one the keys set, with their indices.
+pub fn creature_knobs(def: &'static CreatureDef) -> impl Iterator<Item = (usize, &'static ParamDef)> {
+    def.params.iter().enumerate().filter(|(_, p)| p.role != Some(ParamRole::Pitch)).take(CREATURE_KNOBS)
+}
+
+/// A knob position (0..1) as the parameter's value.
+pub fn knob_value(p: &ParamDef, u: f64) -> f64 {
+    let u = u.clamp(0.0, 1.0);
+    if p.log == Some(true) {
+        p.min * (p.max / p.min).powf(u)
+    } else {
+        p.min + (p.max - p.min) * u
+    }
+}
+
+/// A parameter's value as a knob position (0..1).
+pub fn knob_position(p: &ParamDef, v: f64) -> f64 {
+    let u = if p.log == Some(true) { (v / p.min).ln() / (p.max / p.min).ln() } else { (v - p.min) / (p.max - p.min) };
+    u.clamp(0.0, 1.0)
+}
+
+/// The knob positions a creature starts from.
+pub fn creature_defaults(def: &'static CreatureDef) -> [f64; CREATURE_KNOBS] {
+    let mut out = [0.5; CREATURE_KNOBS];
+    for (k, (_, p)) in creature_knobs(def).enumerate() {
+        out[k] = knob_position(p, p.default);
+    }
+    out
+}
+
+/// The pitch a key plays on a creature: the keyboard is moved by whole octaves so middle C sits
+/// in the middle of the creature's range, and notes outside the range fold back into it (upstream's
+/// `creatureKeyHz`).
+fn creature_key_hz(midi: f64, p: &ParamDef) -> f64 {
+    let shift = ((p.min * p.max).sqrt() / midi_to_hz(60.0)).log2().round();
+    let mut f = midi_to_hz(midi) * 2f64.powf(shift);
+    while f > p.max {
+        f /= 2.0;
+    }
+    while f < p.min {
+        f *= 2.0;
+    }
+    f.min(p.max)
+}
+
+// ---------------------------------------------------------------------- beatbox
+
+/// The key of the first drum sound (C1 in Bitwig's naming, where drum clips start).
+pub const BEAT_KEY: u8 = 36;
+/// The hum's index in the engine's sounds.
+pub const HUM: usize = 9;
+
+/// The drum sound a key plays (an index into the engine's `BEAT_SOUNDS`), laid out like a General
+/// MIDI kit; `None` for the keys that hum.
+pub fn beat_for_key(key: u8) -> Option<usize> {
+    Some(match key {
+        36 => 0, // kick
+        37 => 4, // rimshot
+        38 => 3, // snare
+        39 => 7, // lip pop
+        40 => 5, // inward snare
+        41 => 6, // tongue click
+        42 => 1, // hi-hat
+        43 => 6,
+        44 => 1,
+        45 => 7,
+        46 => 2, // open hat
+        47 => 8, // crash
+        _ => return None,
+    })
+}
+
+/// The first key that plays a sound.
+pub fn key_for_beat(sound: usize) -> Option<u8> {
+    (36..48).find(|k| beat_for_key(*k) == Some(sound))
+}
+
+// ----------------------------------------------------------------------
 
 /// breath level for a key velocity (0..1); 1 at a velocity of 96/127, as upstream
 fn breath_for(velocity: f64) -> f64 {
@@ -108,8 +229,40 @@ struct Sounding {
     index: Option<usize>,
 }
 
+/// An engine and what goes with it, built off the audio thread.
+pub struct Built {
+    pub engine: Engine,
+    pub body: BodyMix,
+    /// sized for the engine's creature, so filling it never allocates
+    creature_tele: CreatureTelemetry,
+}
+
+impl Built {
+    /// `eco` simulates the human airway at the output rate instead of oversampling it (about half
+    /// the processor time, a slightly duller and less exact voice). It is only used where the
+    /// simulation still runs fast enough to be stable (44.1 kHz and up). `creature` (an index
+    /// into the bestiary) plays that animal instead of the human voice.
+    pub fn new(sample_rate: f64, body: BodyMix, eco: bool, creature: Option<usize>) -> Built {
+        let mut e = Engine::new(sample_rate);
+        if body != BodyMix::MALE {
+            e.set_body(body);
+        }
+        if eco && sample_rate >= 44000.0 && oversample_for(sample_rate) > 1 {
+            let mut v = HumanVoice::new(sample_rate, body.body(), 1);
+            v.set_source(&SourcePatch::f0(default_f0(body)));
+            *e.voice_mut() = v;
+        }
+        if let Some(i) = creature {
+            e.set_creature(Some(self::creature(i)), &[]);
+        }
+        let creature_tele = e.creature().map(|c| c.new_telemetry()).unwrap_or_default();
+        Built { engine: e, body, creature_tele }
+    }
+}
+
 pub struct Performer {
     engine: Engine,
+    creature_tele: CreatureTelemetry,
     sample_rate: f64,
     mode: Mode,
     body: BodyMix,
@@ -120,7 +273,8 @@ pub struct Performer {
     bend: f64,
     bend_applied: f64,
 
-    syllables: Vec<Syllable>,
+    phrases: Vec<Vec<Syllable>>,
+    phrase: usize,
     /// the syllable the next key sings
     cursor: usize,
     sounding: Option<Sounding>,
@@ -135,32 +289,47 @@ pub struct Performer {
     tails: Vec<f64>,
     exhales_live: bool,
 
-    /// vowel mode: the key sounding, and how long it has (s)
-    vowel_key: Option<u8>,
+    /// vowel and creature modes: the key sounding, and how long it has (s)
+    held_key: Option<u8>,
     note_age: f64,
     pad: (f64, f64),
     pad_table: [(f64, f64, ArticPatch); PAD_VOWELS.len()],
     last_source: SourcePatch,
+
+    key_action: KeyAction,
+    knobs: [f64; CREATURE_KNOBS],
+    knobs_sent: bool,
+
+    /// the hum sounding: its key and tag
+    hum: Option<(u8, f64)>,
+    scratch: Vec<Gesture>,
+    /// the last drum sound played, and how many have been (for the editor's pads)
+    last_beat: usize,
+    beat_count: u32,
+    /// samples still to mute: a new engine thumps faintly while its mouth settles
+    settling: usize,
 }
 
 impl Performer {
     pub fn new(sample_rate: f64) -> Performer {
-        Self::with_engine(Engine::new(sample_rate), BodyMix::MALE)
+        Self::with(Built::new(sample_rate, BodyMix::MALE, false, None))
     }
 
-    /// A performer on an engine built elsewhere (off the audio thread) for `body`.
-    pub fn with_engine(engine: Engine, body: BodyMix) -> Performer {
-        let sample_rate = engine.sample_rate;
+    /// A performer on an engine built elsewhere (off the audio thread).
+    pub fn with(built: Built) -> Performer {
+        let sample_rate = built.engine.sample_rate;
         let mut p = Performer {
-            engine,
+            engine: built.engine,
+            creature_tele: built.creature_tele,
             sample_rate,
             mode: Mode::Sing,
-            body,
+            body: built.body,
             tone: Tone::default(),
             transpose: 0.0,
             bend: 0.0,
             bend_applied: 0.0,
-            syllables: Vec::new(),
+            phrases: (0..PHRASES).map(|_| Vec::new()).collect(),
+            phrase: 0,
             cursor: 0,
             sounding: None,
             keys: Vec::with_capacity(128),
@@ -169,57 +338,58 @@ impl Performer {
             next_tag: 2.0,
             tails: Vec::with_capacity(8),
             exhales_live: false,
-            vowel_key: None,
+            held_key: None,
             note_age: 0.0,
             pad: (0.85, 1.0),
             pad_table: [(0.0, 0.0, ArticPatch::default()); PAD_VOWELS.len()],
             last_source: SourcePatch::default(),
+            key_action: KeyAction::Hold,
+            knobs: [0.5; CREATURE_KNOBS],
+            knobs_sent: false,
+            hum: None,
+            scratch: Vec::with_capacity(MAX_SOUND_GESTURES),
+            last_beat: 0,
+            beat_count: 0,
+            settling: 0,
         };
+        p.settle();
         p.build_pad_table();
-        p.apply_pad();
+        p.apply_posture();
         p.sync_source();
         p
     }
 
-    /// An engine for `body`, ready to hand to [`Performer::swap_engine`]. Allocates: build it off
-    /// the audio thread.
-    ///
-    /// `eco` simulates the airway at the output rate instead of oversampling it (about half the
-    /// processor time, a slightly duller and less exact voice). It is only offered where the
-    /// simulation still runs fast enough to be stable (44.1 kHz and up).
-    pub fn build_engine(sample_rate: f64, body: BodyMix, eco: bool) -> Engine {
-        let mut e = Engine::new(sample_rate);
-        if body != BodyMix::MALE {
-            e.set_body(body);
-        }
-        if eco && sample_rate >= 44000.0 && oversample_for(sample_rate) > 1 {
-            let mut v = HumanVoice::new(sample_rate, body.body(), 1);
-            v.set_source(&SourcePatch::f0(default_f0(body)));
-            *e.voice_mut() = v;
-        }
-        e
+    /// Take an engine built for another body, quality or creature. Whatever was sounding stops.
+    /// Returns the old one, to be dropped off the audio thread.
+    pub fn swap(&mut self, built: Built) -> Built {
+        self.forget_notes();
+        let old = Built { engine: std::mem::replace(&mut self.engine, built.engine), body: self.body, creature_tele: std::mem::replace(&mut self.creature_tele, built.creature_tele) };
+        self.body = built.body;
+        self.last_source = SourcePatch::default();
+        self.knobs_sent = false;
+        self.build_pad_table();
+        self.apply_posture();
+        self.sync_source();
+        self.sync_knobs();
+        self.settle();
+        old
     }
 
-    /// Change the body by taking an engine built for it. Whatever was sounding stops. Returns the
-    /// old engine, to be dropped off the audio thread.
-    pub fn swap_engine(&mut self, engine: Engine, body: BodyMix) -> Engine {
-        self.forget_notes();
-        let old = std::mem::replace(&mut self.engine, engine);
-        self.body = body;
-        self.last_source = SourcePatch::default();
-        self.build_pad_table();
-        self.apply_pad();
-        self.sync_source();
-        old
+    /// Mute the engine's first moments.
+    fn settle(&mut self) {
+        self.settling = (0.2 * self.sample_rate) as usize;
     }
 
     /// Change the body in place (allocates; for offline use and tests).
     pub fn set_body(&mut self, body: BodyMix) {
-        if body == self.body {
-            return;
+        if body != self.body {
+            self.swap(Built::new(self.sample_rate, body, false, None));
         }
-        let e = Self::build_engine(self.sample_rate, body, false);
-        self.swap_engine(e, body);
+    }
+
+    /// Play a creature, or the human voice again (allocates; for offline use and tests).
+    pub fn set_creature(&mut self, creature: Option<usize>) {
+        self.swap(Built::new(self.sample_rate, self.body, false, creature));
     }
 
     pub fn body(&self) -> BodyMix {
@@ -234,6 +404,7 @@ impl Performer {
         if mode != self.mode {
             self.all_notes_off();
             self.mode = mode;
+            self.apply_posture();
             self.sync_source();
         }
     }
@@ -258,19 +429,42 @@ impl Performer {
         let p = (x.clamp(0.0, 1.0), y.clamp(0.0, 1.0));
         if p != self.pad {
             self.pad = p;
-            self.apply_pad();
+            self.apply_posture();
         }
     }
 
-    /// New lyrics. The cursor goes back to the start. Returns the old ones (drop them off the
-    /// audio thread).
-    pub fn set_lyrics(&mut self, syllables: Vec<Syllable>) -> Vec<Syllable> {
+    // ------------------------------------------------------------------ lyrics
+
+    /// New lyrics for every phrase (missing ones are empty). The cursor goes back to the start.
+    /// Returns the old ones (drop them off the audio thread).
+    pub fn set_phrases(&mut self, mut phrases: Vec<Vec<Syllable>>) -> Vec<Vec<Syllable>> {
+        phrases.resize_with(PHRASES, Vec::new);
         self.cursor = 0;
-        std::mem::replace(&mut self.syllables, syllables)
+        std::mem::replace(&mut self.phrases, phrases)
+    }
+
+    /// One phrase's lyrics, as the first phrase (for tests and simple hosts).
+    pub fn set_lyrics(&mut self, syllables: Vec<Syllable>) {
+        self.set_phrases(vec![syllables]);
+        self.phrase = 0;
+    }
+
+    /// Sing another phrase, from its first syllable.
+    pub fn select_phrase(&mut self, i: usize) {
+        self.phrase = i.min(PHRASES - 1);
+        self.cursor = 0;
+    }
+
+    pub fn phrase(&self) -> usize {
+        self.phrase
+    }
+
+    fn syllables(&self) -> &[Syllable] {
+        &self.phrases[self.phrase]
     }
 
     pub fn syllable_count(&self) -> usize {
-        self.syllables.len()
+        self.syllables().len()
     }
 
     pub fn cursor(&self) -> usize {
@@ -278,7 +472,8 @@ impl Performer {
     }
 
     pub fn set_cursor(&mut self, i: usize) {
-        self.cursor = if self.syllables.is_empty() { 0 } else { i.min(self.syllables.len() - 1) };
+        let n = self.syllables().len();
+        self.cursor = if n == 0 { 0 } else { i.min(n - 1) };
     }
 
     /// The index in the lyrics of the syllable being sung now.
@@ -294,20 +489,49 @@ impl Performer {
         self.engine.telemetry(out);
     }
 
+    /// The creature's telemetry, when one is playing.
+    pub fn creature_telemetry(&mut self) -> Option<&CreatureTelemetry> {
+        if self.engine.creature_telemetry(&mut self.creature_tele) {
+            Some(&self.creature_tele)
+        } else {
+            None
+        }
+    }
+
+    /// The last drum sound played and how many have been.
+    pub fn last_beat(&self) -> (usize, u32) {
+        (self.last_beat, self.beat_count)
+    }
+
     fn pitch_of(&self, key: u8) -> f64 {
         key as f64 + self.transpose + self.bend
+    }
+
+    /// The engine is playing what the mode needs (a creature in creature mode, the human
+    /// otherwise). It is not for a moment after the mode changes, while the other is built.
+    fn ready(&self) -> bool {
+        self.engine.creature().is_some() == (self.mode == Mode::Creature)
     }
 
     // ------------------------------------------------------------------ notes
 
     /// `velocity` is 0..1.
     pub fn note_on(&mut self, key: u8, velocity: f64) {
+        if self.mode == Mode::Sing && (PHRASE_KEY..PHRASE_KEY + PHRASES as u8).contains(&key) {
+            self.select_phrase((key - PHRASE_KEY) as usize);
+            return;
+        }
+        if !self.ready() {
+            return;
+        }
         self.sustained.retain(|k| *k != key);
         self.keys.retain(|k| *k != key);
         self.keys.push(key);
         match self.mode {
             Mode::Sing => self.sing_note_on(key, velocity),
             Mode::Vowel => self.vowel_note_on(key, velocity),
+            Mode::Creature => self.creature_note_on(key, velocity),
+            Mode::Beatbox => self.beat_note_on(key, velocity),
         }
     }
 
@@ -322,10 +546,15 @@ impl Performer {
     }
 
     fn key_up(&mut self, key: u8) {
+        if !self.keys.contains(&key) {
+            return;
+        }
         self.keys.retain(|k| *k != key);
         match self.mode {
             Mode::Sing => self.sing_note_off(key),
             Mode::Vowel => self.vowel_note_off(key),
+            Mode::Creature => self.creature_note_off(key),
+            Mode::Beatbox => self.beat_note_off(key),
         }
     }
 
@@ -339,7 +568,7 @@ impl Performer {
         }
     }
 
-    /// Stop everything sung: notes, endings, and whatever the score still holds.
+    /// Stop everything: notes, endings, calls, and whatever the score still holds.
     pub fn all_notes_off(&mut self) {
         if let Some(s) = self.sounding.take() {
             self.engine.release(s.tag);
@@ -351,6 +580,7 @@ impl Performer {
             self.engine.release(t + 1.0);
         }
         self.engine.stop_speech();
+        self.engine.stop_call();
         self.engine.set_gate(0.0);
         self.forget_notes();
     }
@@ -361,19 +591,20 @@ impl Performer {
         self.exhales_live = false;
         self.keys.clear();
         self.sustained.clear();
-        self.vowel_key = None;
+        self.held_key = None;
+        self.hum = None;
     }
 
     // ------------------------------------------------------------------ sing mode
 
     fn sing_note_on(&mut self, key: u8, velocity: f64) {
-        let n = self.syllables.len();
+        let n = self.syllables().len();
         if n == 0 {
             self.start_note(ah(), key, velocity, None);
             return;
         }
         let i = self.cursor % n;
-        if is_melisma(&self.syllables[i]) {
+        if is_melisma(&self.syllables()[i]) {
             if self.sounding.is_some() {
                 self.glide_to(key);
             } else {
@@ -383,7 +614,7 @@ impl Performer {
                 self.start_note(parent, key, velocity, Some(i));
             }
         } else {
-            let syl = self.syllables[i].clone();
+            let syl = self.syllables()[i].clone();
             self.start_note(syl, key, velocity, Some(i));
         }
         self.cursor = (i + 1) % n;
@@ -391,7 +622,7 @@ impl Performer {
 
     /// The syllable a melisma at index i continues.
     fn parent_of(&self, i: usize) -> Syllable {
-        self.syllables[..=i].iter().rev().find(|s| !is_melisma(s)).cloned().unwrap_or_else(ah)
+        self.syllables()[..=i].iter().rev().find(|s| !is_melisma(s)).cloned().unwrap_or_else(ah)
     }
 
     fn start_note(&mut self, syl: Syllable, key: u8, velocity: f64, index: Option<usize>) {
@@ -449,8 +680,8 @@ impl Performer {
         self.engine.release(s.tag);
         self.engine.release(s.tag + 1.0);
         // a melisma comes next: this vowel carries on there, and the coda waits for the chain's end
-        let n = self.syllables.len();
-        if n > 0 && is_melisma(&self.syllables[self.cursor % n]) {
+        let n = self.syllables().len();
+        if n > 0 && is_melisma(&self.syllables()[self.cursor % n]) {
             return;
         }
         let mut gestures = plan_note_off(&s.syl, s.pitch, self.body);
@@ -473,22 +704,22 @@ impl Performer {
     // ------------------------------------------------------------------ vowel mode
 
     fn vowel_note_on(&mut self, key: u8, velocity: f64) {
-        if self.vowel_key.is_none() {
+        if self.held_key.is_none() {
             self.note_age = 0.0;
         }
-        self.vowel_key = Some(key);
+        self.held_key = Some(key);
         self.engine.set_gate(breath_for(velocity));
         self.sync_source();
     }
 
     fn vowel_note_off(&mut self, key: u8) {
-        if self.vowel_key != Some(key) {
+        if self.held_key != Some(key) {
             return;
         }
         match self.keys.last() {
-            Some(&last) => self.vowel_key = Some(last),
+            Some(&last) => self.held_key = Some(last),
             None => {
-                self.vowel_key = None;
+                self.held_key = None;
                 self.engine.set_gate(0.0);
             }
         }
@@ -502,8 +733,13 @@ impl Performer {
         }
     }
 
-    /// The posture under the pad's handle: the calibrated vowels around it, blended by distance.
-    fn apply_pad(&mut self) {
+    /// The mouth's resting posture: the vowel under the pad's handle (the calibrated vowels around
+    /// it, blended by distance), or a beatboxer's ready posture.
+    fn apply_posture(&mut self) {
+        if self.mode == Mode::Beatbox {
+            self.engine.set_artic(&beat_ready(self.body), None);
+            return;
+        }
         let (x, y) = self.pad;
         let mut parts = [(0.0, ArticPatch::default()); PAD_VOWELS.len()];
         for (i, (vx, vy, patch)) in self.pad_table.iter().enumerate() {
@@ -512,6 +748,139 @@ impl Performer {
             parts[i] = (w * w, *patch);
         }
         self.engine.set_artic(&ArticPatch::blend(&parts), None);
+    }
+
+    // ------------------------------------------------------------------ creature mode
+
+    pub fn set_key_action(&mut self, action: KeyAction) {
+        if action != self.key_action {
+            if self.mode == Mode::Creature {
+                self.all_notes_off();
+            }
+            self.key_action = action;
+        }
+    }
+
+    /// The creature's knobs (0..1 each, in the order of [`creature_knobs`]).
+    pub fn set_knobs(&mut self, knobs: &[f64; CREATURE_KNOBS]) {
+        if *knobs != self.knobs || !self.knobs_sent {
+            self.knobs = *knobs;
+            self.sync_knobs();
+        }
+    }
+
+    fn sync_knobs(&mut self) {
+        let Some(def) = self.engine.creature().map(|c| c.def) else { return };
+        let mut values = [(0usize, 0.0f64); CREATURE_KNOBS];
+        let mut n = 0;
+        for (k, (i, p)) in creature_knobs(def).enumerate() {
+            values[n] = (i, knob_value(p, self.knobs[k]));
+            n += 1;
+        }
+        self.engine.set_creature_params(&values[..n]);
+        self.knobs_sent = true;
+    }
+
+    /// The creature's pitch parameter and the pitch this key plays on it.
+    fn creature_pitch(&self, key: u8) -> Option<(usize, f64)> {
+        let def = self.engine.creature()?.def;
+        let i = def.params.iter().position(|p| p.role == Some(ParamRole::Pitch))?;
+        Some((i, creature_key_hz(self.pitch_of(key), &def.params[i])))
+    }
+
+    fn creature_note_on(&mut self, key: u8, velocity: f64) {
+        let pitch = self.creature_pitch(key);
+        let calls = self.engine.creature().map_or(0, |c| c.def.calls.len());
+        match self.key_action {
+            KeyAction::Call(i) if i < calls => {
+                self.engine.play_call(i, pitch.map(|p| p.1), Some(0.5 + 0.6 * velocity));
+            }
+            _ => {
+                if let Some(p) = pitch {
+                    self.engine.set_creature_params(&[p]);
+                }
+                self.held_key = Some(key);
+                self.bend_applied = self.bend;
+                self.engine.set_gate(breath_for(velocity));
+            }
+        }
+    }
+
+    fn creature_note_off(&mut self, key: u8) {
+        if self.held_key != Some(key) {
+            return;
+        }
+        match self.keys.last().copied() {
+            Some(last) => {
+                self.held_key = Some(last);
+                if let Some(p) = self.creature_pitch(last) {
+                    self.engine.set_creature_params(&[p]);
+                }
+            }
+            None => {
+                self.held_key = None;
+                self.engine.set_gate(0.0);
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ beatbox mode
+
+    fn beat_note_on(&mut self, key: u8, velocity: f64) {
+        match beat_for_key(key) {
+            Some(sound) => self.beat(sound, velocity),
+            None => self.start_hum(key, velocity),
+        }
+    }
+
+    /// Play a drum sound (an index into the engine's `BEAT_SOUNDS`) as soon as the mouth can make
+    /// it. The hum (the last sound) plays a short note here; the keys hold it.
+    pub fn beat(&mut self, sound: usize, velocity: f64) {
+        if self.mode != Mode::Beatbox || !self.ready() || sound >= BEAT_SOUNDS.len() {
+            return;
+        }
+        let accent = 0.55 + 0.75 * velocity.clamp(0.0, 1.0);
+        let note = if sound == HUM { Some(40.0 + self.transpose) } else { None };
+        self.engine.beat_hit(&BeatStep { id: Label::new(BEAT_SOUNDS[sound].id), note, accent: Some(accent) });
+        self.last_beat = sound;
+        self.beat_count = self.beat_count.wrapping_add(1);
+    }
+
+    /// A hummed bass note, held until its key comes up.
+    fn start_hum(&mut self, key: u8, velocity: f64) {
+        let Some(sound) = beat_sound(BEAT_SOUNDS[HUM].id) else { return };
+        if let Some((_, tag)) = self.hum.take() {
+            self.engine.release(tag);
+        }
+        let accent = 0.55 + 0.75 * velocity.clamp(0.0, 1.0);
+        self.scratch.clear();
+        (sound.build)(self.body, &BeatBuild { f0: midi_to_hz(self.pitch_of(key)), len: 30.0, accent }, &mut self.scratch);
+        let tag = self.next_tag;
+        self.next_tag += 2.0;
+        // the hit is at the gestures' time 0: start early enough for the lips to shut first
+        let mut lead: f64 = 0.0;
+        for g in &mut self.scratch {
+            g.tag = Some(tag);
+            lead = lead.max(-(g.t0 - g.ramp_in));
+        }
+        self.engine.schedule(&self.scratch, lead, false);
+        self.hum = Some((key, tag));
+        self.last_beat = HUM;
+        self.beat_count = self.beat_count.wrapping_add(1);
+    }
+
+    fn beat_note_off(&mut self, key: u8) {
+        match self.hum {
+            Some((k, tag)) if k == key => {
+                self.engine.release(tag);
+                self.hum = None;
+                // back to a hum key still held
+                if let Some(last) = self.keys.iter().rev().copied().find(|k| beat_for_key(*k).is_none()) {
+                    self.start_hum(last, 0.7);
+                }
+            }
+            _ => {}
+        }
     }
 
     // ------------------------------------------------------------------ source
@@ -535,7 +904,7 @@ impl Performer {
             f0: None,
         };
         if self.mode == Mode::Vowel {
-            if let Some(key) = self.vowel_key {
+            if let Some(key) = self.held_key {
                 p.f0 = Some(midi_to_hz(self.pitch_of(key)));
                 // a note from silence starts on its pitch instead of sliding up to it
                 if self.note_age < 0.03 {
@@ -564,8 +933,24 @@ impl Performer {
                 }
             }
             Mode::Vowel => self.sync_source(),
+            Mode::Creature => {
+                if let Some(key) = self.held_key {
+                    if (self.bend - self.bend_applied).abs() > 0.001 {
+                        if let Some(p) = self.creature_pitch(key) {
+                            self.engine.set_creature_params(&[p]);
+                        }
+                        self.bend_applied = self.bend;
+                    }
+                }
+            }
+            Mode::Beatbox => {}
         }
         self.engine.render(out);
+        if self.settling > 0 {
+            let n = self.settling.min(out.len());
+            out[..n].fill(0.0);
+            self.settling -= n;
+        }
         self.note_age += out.len() as f64 / self.sample_rate;
     }
 }

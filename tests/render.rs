@@ -3,7 +3,7 @@
 
 use chimera::anatomy::human::BodyMix;
 use chimera_voice::lyrics;
-use chimera_voice::performer::{Mode, Performer, Tone};
+use chimera_voice::performer::{Built, Mode, Performer, Tone};
 use std::time::Instant;
 
 const FS: f64 = 48000.0;
@@ -209,7 +209,7 @@ fn bend_sustain_and_panic() {
 fn eco_quality_holds_and_costs_less() {
     let mut cost = Vec::new();
     for eco in [false, true] {
-        let mut p = Performer::with_engine(Performer::build_engine(FS, BodyMix::FEMALE, eco), BodyMix::FEMALE);
+        let mut p = Performer::with(Built::new(FS, BodyMix::FEMALE, eco, None));
         p.set_lyrics(lyrics::parse("Hello there, I am a voice made of air."));
         p.set_tone(&Tone { vibrato: 0.0, drift: 0.0, ..Tone::default() });
         let mut out = Vec::new();
