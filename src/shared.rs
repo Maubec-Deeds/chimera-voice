@@ -101,6 +101,10 @@ pub struct Shared {
     pub beat_count: AtomicU32,
     /// the editor asks for silence
     pub panic: AtomicBool,
+    /// the webcam tracker's latest frame, and the listener that receives it (started and stopped
+    /// by the background task, never on the audio thread)
+    pub face: std::sync::Arc<crate::face::State>,
+    pub face_listener: Mutex<Option<crate::face::Listener>>,
     pub viz: Mutex<Viz>,
     /// text a file dialog loaded, for the editor to take
     pub loaded_text: Mutex<Option<String>>,

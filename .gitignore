@@ -1,2 +1,6 @@
 /target
 /dist
+/tools/facetrack/.venv
+/tools/facetrack/face_landmarker.task
+/tools/facetrack/calibration.json
+__pycache__/

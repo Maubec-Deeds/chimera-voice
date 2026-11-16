@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
 mod editor;
+pub mod face;
 pub mod lyrics;
 pub mod performer;
 pub mod shared;
@@ -172,6 +173,9 @@ pub struct ChimeraParams {
     pub eco: BoolParam,
     #[id = "restart"]
     pub restart_on_play: BoolParam,
+    /// follow a webcam face tracker (tools/facetrack)
+    #[id = "face"]
+    pub face: BoolParam,
     #[id = "gain"]
     pub gain: FloatParam,
 }
@@ -248,6 +252,7 @@ impl Default for ChimeraParams {
 
             eco: BoolParam::new("Eco Quality", false).non_automatable(),
             restart_on_play: BoolParam::new("Restart Lyrics On Play", true),
+            face: BoolParam::new("Face Control", false).non_automatable(),
             gain: FloatParam::new("Volume", 0.0, FloatRange::Linear { min: -30.0, max: 12.0 })
                 .with_unit(" dB")
                 .with_value_to_string(formatters::v2s_f32_rounded(1))
@@ -267,6 +272,8 @@ impl ChimeraParams {
 pub enum Task {
     /// build an engine, off the audio thread
     Build { sample_rate: f64, spec: VoiceSpec },
+    /// listen for the face tracker, or stop
+    Face(bool),
 }
 
 pub struct ChimeraVoice {
@@ -286,6 +293,10 @@ pub struct ChimeraVoice {
     spec_now: VoiceSpec,
     building: bool,
     was_playing: bool,
+    face: face::Follower,
+    /// whether the listener has been asked to run, and the key the face sings
+    face_asked: bool,
+    face_key: u8,
     phrase_seen: i32,
     bend: f64,
     mod_wheel: f64,
@@ -309,6 +320,9 @@ impl Default for ChimeraVoice {
             spec_now: spec,
             building: false,
             was_playing: false,
+            face: face::Follower::default(),
+            face_asked: false,
+            face_key: 57,
             phrase_seen: 1,
             bend: 0.0,
             mod_wheel: 0.0,
@@ -343,7 +357,13 @@ impl ChimeraVoice {
     fn handle_event(&mut self, event: PluginNoteEvent<Self>) {
         let Some(perf) = self.performer.as_mut() else { return };
         match event {
-            NoteEvent::NoteOn { note, velocity, .. } => perf.note_on(note, velocity as f64),
+            NoteEvent::NoteOn { note, velocity, .. } => {
+                // the face sings on the last key played (not a phrase keyswitch)
+                if !(performer::PHRASE_KEY..performer::PHRASE_KEY + PHRASES as u8).contains(&note) {
+                    self.face_key = note;
+                }
+                perf.note_on(note, velocity as f64)
+            }
             NoteEvent::NoteOff { note, .. } | NoteEvent::Choke { note, .. } => perf.note_off(note),
             NoteEvent::MidiPitchBend { value, .. } => {
                 self.bend = (value as f64 * 2.0 - 1.0) * self.params.bend_range.value() as f64;
@@ -392,6 +412,15 @@ impl Plugin for ChimeraVoice {
                 b.incoming = Some((spec, built));
                 drop(b);
                 shared.engine_ready.store(true, Ordering::Release);
+            }
+            Task::Face(on) => {
+                let mut l = shared.face_listener.lock();
+                if on && l.is_none() {
+                    *l = face::Listener::start(face::DEFAULT_PORT, shared.face.clone());
+                } else if !on {
+                    *l = None; // stops the thread
+                    shared.face.status.store(face::OFF, Ordering::Release);
+                }
             }
         })
     }
@@ -481,7 +510,16 @@ impl Plugin for ChimeraVoice {
             });
             perf.set_tone(&tone);
             perf.set_transpose(12.0 * self.params.octave.value() as f64);
-            perf.set_pad(self.params.vowel_x.value() as f64, self.params.vowel_y.value() as f64);
+            // the face moves the pad while it is being tracked; the parameters otherwise
+            let face_on = self.params.face.value();
+            if !(face_on && self.face.live()) {
+                perf.set_pad(self.params.vowel_x.value() as f64, self.params.vowel_y.value() as f64);
+            }
+            if face_on {
+                self.face.apply(&shared.face.load(), perf, self.face_key, n as f64 / self.sample_rate);
+            } else {
+                self.face.release(perf);
+            }
             perf.set_key_action(self.params.keys.value().action());
             let mut knobs = [0.0; CREATURE_KNOBS];
             for (k, p) in knobs.iter_mut().zip(self.params.knobs.iter()) {
@@ -514,6 +552,13 @@ impl Plugin for ChimeraVoice {
                 perf.set_cursor(0);
             }
             self.was_playing = playing;
+        }
+
+        // ---- the face listener: started and stopped off the audio thread
+        let face_on = self.params.face.value();
+        if face_on != self.face_asked {
+            self.face_asked = face_on;
+            context.execute_background(Task::Face(face_on));
         }
 
         // ---- the voice: built in the background once what is asked for has stood still a moment

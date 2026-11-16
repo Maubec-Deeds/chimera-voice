@@ -62,6 +62,34 @@ The keys from C1 play the mouth's drum sounds, laid out like a General MIDI kit:
 
 Click a pad to hear it.
 
+### Face control (experimental)
+
+A webcam watches your mouth and Chimera follows it. Lips and jaw are all a camera can see, so
+the words still come from the lyrics; the face supplies timing and mouth shape.
+
+1. Turn on **FACE** in the top bar.
+2. Double-click `tools/facetrack/Start face tracker.cmd`. The first run needs Python 3.12
+   (python.org) and sets itself up, which takes a few minutes and about 300 MB.
+3. Calibrate once in the tracker's window: press **C** with lips relaxed and shut, **O** on a wide
+   "aah", **U** on an "oo", **E** on an "ee". This is saved for next time.
+
+What the mouth does:
+
+- **Sing**: each time the mouth opens it sings the next syllable; opening again after closing
+  part way sings the next one legato; shutting the mouth ends the note.
+- **Vowel**: the mouth moves the pad (a spread mouth is "ee", rounded is "oo", the opening is how
+  open the vowel is) and opening it sounds the note.
+- **Creature**: opening the mouth plays a held note.
+
+The face sings on the last key you played. The dot on the FACE button is green while a face is
+tracked, amber when the tracker runs but sees no face, blue when nothing is sending, and red
+when another Chimera already has face control (only one can listen at a time).
+
+Expect the voice to trail the mouth by about a tenth of a second. Mouthing silently while
+listening to Chimera works better than speaking aloud with it, which sounds like an echo. A
+dim room makes the camera slow down and adds delay, so light your face. The tracker sends to
+127.0.0.1 only; nothing leaves the computer, and no images are saved.
+
 ### Everywhere
 
 - **Body**: man, woman, child, or anywhere between. **Octave** shifts the keyboard.
@@ -88,7 +116,7 @@ Needs Rust (`rustup`, stable, MSVC toolchain).
 ```
 git submodule update --init
 ./install.ps1        # builds and copies "Chimera Voice.clap" to %LOCALAPPDATA%\Programs\Common\CLAP
-cargo test --release # plays test phrases, creatures and drums; WAVs land in target/renders
+cargo test --release # plays test phrases, creatures, drums and made-up face frames; WAVs land in target/renders
 ```
 
 `target/release/chimera_voice_standalone.exe` runs the plugin on its own with the system's audio
@@ -101,7 +129,9 @@ and MIDI devices.
 - `src/lyrics.rs`: text → syllables (words, sound codes, IPA), with the dictionary built in.
 - `src/lib.rs`: the plugin (parameters, MIDI, audio callback).
 - `src/editor.rs`: the editor (egui).
+- `src/face.rs`: the face tracker's packets, the listener, and how frames become notes.
 - `src/shared.rs`: what the audio thread, the editor and the background task share.
+- `tools/facetrack/`: the webcam tracker (Python, MediaPipe).
 
 ## Licences
 
@@ -113,3 +143,5 @@ This project is MIT-licensed (see `LICENSE`). It builds on:
 - [NIH-plug](https://github.com/robbert-vdh/nih-plug), ISC; [egui](https://github.com/emilk/egui),
   [copypasta](https://github.com/alacritty/copypasta) and [rfd](https://github.com/PolyMeilex/rfd),
   MIT / Apache-2.0.
+- The face tracker uses [MediaPipe](https://github.com/google-ai-edge/mediapipe) and its face
+  landmarker model (Apache-2.0, downloaded on first run) and [OpenCV](https://opencv.org) (Apache-2.0).

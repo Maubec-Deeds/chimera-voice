@@ -382,6 +382,10 @@ struct State {
     beat_count: u32,
     /// what the bottom line of a panel says (a pad's or a call's hint)
     hint: &'static str,
+    /// face tracker packets seen, and how long since the last (s)
+    face_packets: u32,
+    face_last: Option<std::time::Instant>,
+    face_seen: f64,
 }
 
 impl State {
@@ -415,6 +419,9 @@ pub fn create(params: Arc<ChimeraParams>, shared: Arc<Shared>) -> Option<Box<dyn
         flash: [0.0; 10],
         beat_count: shared.beat_count.load(Ordering::Relaxed),
         hint: "",
+        face_packets: 0,
+        face_last: None,
+        face_seen: f64::INFINITY,
     };
     create_egui_editor(
         params.editor_state.clone(),
@@ -499,6 +506,35 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         shared.panic.store(true, Ordering::Release);
     }
     // half the processor time for a slightly duller voice
+    // follow a webcam face tracker (tools/facetrack); the dot says whether it is sending
+    let face_rect = Rect::from_min_size(pos2(top.right() - 216.0, top.top() + 6.0), vec2(58.0, 28.0));
+    if toggle(ui, face_rect, "FACE", params.face.value(), GREEN) {
+        set(setter, &params.face, !params.face.value());
+    }
+    {
+        // timed by the clock: the window may be redrawn seldom while it is in the background
+        let packets = shared.face.packets.load(Ordering::Acquire);
+        if packets != st.face_packets {
+            st.face_packets = packets;
+            st.face_last = Some(std::time::Instant::now());
+        }
+        st.face_seen = st.face_last.map_or(f64::INFINITY, |t| t.elapsed().as_secs_f64());
+        let status = shared.face.status.load(Ordering::Acquire);
+        let (color, tip) = if !params.face.value() {
+            (FRAME, "Face control is off")
+        } else if status == crate::face::BUSY {
+            (RED, "Port 9123 is in use (another Chimera with FACE on?)")
+        } else if st.face_seen < 0.5 && shared.face.load().present {
+            (GREEN, "Tracking your face")
+        } else if st.face_seen < 0.5 {
+            (AMBER, "The tracker sees no face")
+        } else {
+            (BLUE_DIM, "Waiting for the tracker: run tools/facetrack")
+        };
+        let dot = pos2(face_rect.right() - 9.0, face_rect.top() + 7.0);
+        ui.painter().circle_filled(dot, 3.5, color);
+        ui.interact(face_rect, ui.id().with("face-tip"), Sense::hover()).on_hover_text(tip);
+    }
     if toggle(ui, Rect::from_min_size(pos2(top.right() - 150.0, top.top() + 6.0), vec2(58.0, 28.0)), "ECO", params.eco.value(), AMBER) {
         set(setter, &params.eco, !params.eco.value());
     }
@@ -506,7 +542,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         let p = ui.painter();
         let singing = voicing > 0.2 && st.level > 0.003;
         let pitch = if singing { format!("{}  {:.0} Hz", note_name(f0), f0) } else { "--".to_string() };
-        p.text(pos2(top.right() - 166.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
+        p.text(pos2(top.right() - 232.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
     }
 
     // ---- left: the head or the creature's airway, then the body or the bestiary
@@ -623,7 +659,10 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
 
     match mode {
         ModeParam::Sing => draw_lyrics(ui, main, params, shared, setter, st),
-        ModeParam::Vowel => draw_pad(ui, main, params, setter),
+        ModeParam::Vowel => {
+            let face = (params.face.value() && st.face_seen < 0.5).then(|| shared.face.load()).filter(|f| f.present);
+            draw_pad(ui, main, params, setter, face.map(|f| crate::face::pad_from_face(f.opening, f.rounding)))
+        }
         ModeParam::Creature => draw_creature(ui, main, params, setter, st),
         ModeParam::Beatbox => draw_beatbox(ui, main, shared, st),
     }
@@ -866,7 +905,8 @@ fn draw_help(ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------------- vowel
 
-fn draw_pad(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, setter: &ParamSetter) {
+/// `face`: where the face tracker has the handle, while it does.
+fn draw_pad(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, setter: &ParamSetter, face: Option<(f64, f64)>) {
     panel(ui.painter(), rect, "VOWEL  -  drag to shape the mouth while you play");
     let pad = Rect::from_min_max(rect.min + vec2(44.0, 44.0), rect.max - vec2(44.0, 30.0));
     let resp = ui.interact(pad.expand(16.0), ui.id().with("vowel-pad"), Sense::click_and_drag());
@@ -894,7 +934,10 @@ fn draw_pad(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, setter: &Para
         setter.end_set_parameter(&params.vowel_x);
         setter.end_set_parameter(&params.vowel_y);
     }
-    let (x, y) = (params.vowel_x.value(), params.vowel_y.value());
+    let (x, y) = match face {
+        Some((fx, fy)) => (fx as f32, fy as f32),
+        None => (params.vowel_x.value(), params.vowel_y.value()),
+    };
     let at = |vx: f32, vy: f32| pos2(pad.left() + pad.width() * vx, pad.top() + pad.height() * vy);
     let p = ui.painter();
     // the vowel chart's outline, like a border on a map
