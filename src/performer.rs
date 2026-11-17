@@ -16,7 +16,7 @@
 //! Beatbox mode maps the keys C1 to B1 to the mouth's drum sounds; every other key hums a bass
 //! note.
 
-use chimera::anatomy::human::{ArticPatch, BodyMix};
+use chimera::anatomy::human::{ArticKey, ArticPatch, BodyMix, NEUTRAL};
 use chimera::control::score::{ControlKey, Gesture, Label};
 use chimera::creatures::types::{CreatureDef, ParamDef, ParamRole};
 use chimera::creatures::voice::CreatureTelemetry;
@@ -78,6 +78,35 @@ impl Default for Tone {
         Tone { pressure: 8.0, tension: 0.5, brightness: 0.25, breathiness: 0.15, roughness: 0.1, fry: 0.0, vibrato: 35.0, vibrato_rate: 6.0, glide: 0.06, drift: 5.0, whisper: false }
     }
 }
+
+// ---------------------------------------------------------------------- the face's mouth
+
+/// The mouth a face tracker sees, laid over the vowel pad's posture in vowel mode. Everything
+/// is 0..1.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FaceMouth {
+    /// how far the jaw has dropped
+    pub jaw: f64,
+    /// the gap between the lips
+    pub lips: f64,
+    /// how far the lips are pushed forward
+    pub pucker: f64,
+    /// how wide the lips are spread
+    pub spread: f64,
+    /// the lips are shut (a "b"; an "m" once the nose opens)
+    pub closed: f64,
+    /// the lower lip is on the upper teeth ("v", or "f" when whispering)
+    pub teeth: f64,
+    /// the soft palate is open: sound goes through the nose
+    pub nasal: f64,
+}
+
+/// Lip aperture with the lips shut, and with the lower lip against the teeth (as the engine's
+/// own "b" and "v" have them).
+const LIPS_SHUT: f64 = -0.25;
+const LIPS_ON_TEETH: f64 = 0.07;
+/// The soft palate when it lets the sound through the nose (as the engine's "m" has it).
+const VELUM_OPEN: f64 = 0.9;
 
 // ---------------------------------------------------------------------- the vowel pad
 
@@ -294,6 +323,15 @@ pub struct Performer {
     note_age: f64,
     pad: (f64, f64),
     pad_table: [(f64, f64, ArticPatch); PAD_VOWELS.len()],
+    /// the least and most the pad's vowels use of the jaw, lip aperture, protrusion and width
+    lip_range: [(f64, f64); 4],
+    /// the mouth a face tracker sees, while it drives the lips (vowel mode)
+    face_mouth: Option<FaceMouth>,
+    /// the lips have been driven by a face, so the keys it touched are set back when it stops
+    face_touched: bool,
+    /// how hard a held note breathes: the velocity's breath, and what the face scales it by
+    gate_base: f64,
+    effort: f64,
     last_source: SourcePatch,
 
     key_action: KeyAction,
@@ -342,6 +380,11 @@ impl Performer {
             note_age: 0.0,
             pad: (0.85, 1.0),
             pad_table: [(0.0, 0.0, ArticPatch::default()); PAD_VOWELS.len()],
+            lip_range: [(0.0, 1.0); 4],
+            face_mouth: None,
+            face_touched: false,
+            gate_base: 0.0,
+            effort: 1.0,
             last_source: SourcePatch::default(),
             key_action: KeyAction::Hold,
             knobs: [0.5; CREATURE_KNOBS],
@@ -430,6 +473,28 @@ impl Performer {
         if p != self.pad {
             self.pad = p;
             self.apply_posture();
+        }
+    }
+
+    /// The mouth a face tracker sees drives the jaw and lips directly in vowel mode (the pad then
+    /// only places the tongue); `None` hands them back to the pad.
+    pub fn set_face_mouth(&mut self, mouth: Option<FaceMouth>) {
+        if mouth != self.face_mouth {
+            self.face_mouth = mouth;
+            if self.mode == Mode::Vowel {
+                self.apply_posture();
+            }
+        }
+    }
+
+    /// Scale how hard a held vowel or creature note breathes (1: as its velocity set it).
+    pub fn set_effort(&mut self, effort: f64) {
+        let effort = effort.clamp(0.3, 1.3);
+        if (effort - self.effort).abs() > 0.004 {
+            self.effort = effort;
+            if self.held_key.is_some() && matches!(self.mode, Mode::Vowel | Mode::Creature) {
+                self.engine.set_gate(self.gate_base * effort);
+            }
         }
     }
 
@@ -708,7 +773,8 @@ impl Performer {
             self.note_age = 0.0;
         }
         self.held_key = Some(key);
-        self.engine.set_gate(breath_for(velocity));
+        self.gate_base = breath_for(velocity);
+        self.engine.set_gate(self.gate_base * self.effort);
         self.sync_source();
     }
 
@@ -731,6 +797,11 @@ impl Performer {
             let (x, y) = pad_position(ipa);
             self.pad_table[i] = (x, y, vowel_artic(ipa, self.body).unwrap_or_default());
         }
+        for (r, key) in self.lip_range.iter_mut().zip([ArticKey::Jaw, ArticKey::LipAp, ArticKey::LipProt, ArticKey::LipWidth]) {
+            let values = self.pad_table.iter().filter_map(|(_, _, patch)| patch.get(key));
+            let (lo, hi) = values.fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| (lo.min(v), hi.max(v)));
+            *r = if lo <= hi { (lo, hi) } else { (0.0, 1.0) };
+        }
     }
 
     /// The mouth's resting posture: the vowel under the pad's handle (the calibrated vowels around
@@ -747,7 +818,32 @@ impl Performer {
             let w = 1.0 / (d2 + 2e-4);
             parts[i] = (w * w, *patch);
         }
-        self.engine.set_artic(&ArticPatch::blend(&parts), None);
+        let mut posture = ArticPatch::blend(&parts);
+        let lerp = |r: (f64, f64), u: f64| r.0 + (r.1 - r.0) * u.clamp(0.0, 1.0);
+        match self.face_mouth {
+            Some(m) if self.mode == Mode::Vowel => {
+                // the face's own jaw and lips, across the range the vowels use
+                let [jaw, aperture, protrusion, width] = self.lip_range;
+                let mut ap = lerp((aperture.0.min(0.15), aperture.1), m.lips);
+                ap += (LIPS_ON_TEETH - ap) * m.teeth.clamp(0.0, 1.0);
+                ap += (LIPS_SHUT - ap) * m.closed.clamp(0.0, 1.0);
+                posture.set(ArticKey::Jaw, lerp(jaw, m.jaw));
+                posture.set(ArticKey::LipAp, ap);
+                posture.set(ArticKey::LipProt, lerp(protrusion, m.pucker));
+                posture.set(ArticKey::LipWidth, lerp(width, m.spread));
+                posture.set(ArticKey::Labiodental, m.teeth.clamp(0.0, 1.0) * (1.0 - m.closed.clamp(0.0, 1.0)));
+                posture.set(ArticKey::Velum, lerp((NEUTRAL.velum, VELUM_OPEN), m.nasal));
+                self.face_touched = true;
+            }
+            _ if self.face_touched => {
+                // the face let go: the teeth and the nose go back to rest
+                posture.set(ArticKey::Labiodental, NEUTRAL.labiodental);
+                posture.set(ArticKey::Velum, NEUTRAL.velum);
+                self.face_touched = false;
+            }
+            _ => {}
+        }
+        self.engine.set_artic(&posture, None);
     }
 
     // ------------------------------------------------------------------ creature mode
@@ -801,7 +897,8 @@ impl Performer {
                 }
                 self.held_key = Some(key);
                 self.bend_applied = self.bend;
-                self.engine.set_gate(breath_for(velocity));
+                self.gate_base = breath_for(velocity);
+                self.engine.set_gate(self.gate_base * self.effort);
             }
         }
     }

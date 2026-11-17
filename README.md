@@ -19,10 +19,11 @@ syllable each time the transport starts.
 
 Ways to get lyrics in:
 
-- **Type** in the box. English uses the CMU Pronouncing Dictionary; Korean (Hangul) and Russian
-  also work.
-- **Paste** takes the clipboard's text; **Load file** reads a text file. Both work even where the
-  host keeps keystrokes from the plugin window.
+- **Type**: click the box and type. While you type the plugin holds the keyboard (the box has a
+  green edge); click anywhere outside the box to hand it back to the host, so the space bar starts
+  playback again. English uses the CMU Pronouncing Dictionary; Korean (Hangul) and Russian also
+  work.
+- **Paste** takes the clipboard's text; **Load file** reads a text file.
 - **Eight phrases** (the numbered buttons), saved with the project. Pick the one to sing by
   clicking, by automating *Phrase*, or by playing a keyswitch: C0 to G0 (MIDI notes 24 to 31)
   pick phrases 1 to 8 and start them from the top.
@@ -64,26 +65,41 @@ Click a pad to hear it.
 
 ### Face control (experimental)
 
-A webcam watches your mouth and Chimera follows it. Lips and jaw are all a camera can see, so
-the words still come from the lyrics; the face supplies timing and mouth shape.
+A webcam watches your face and Chimera follows it: the mouth in detail, plus eyebrows, head tilt
+and smile. A camera cannot see the tongue, so sounds made with it (t, d, s, l, k) cannot be read
+from the face, and in Sing mode the words still come from the lyrics.
 
 1. Turn on **FACE** in the top bar.
 2. Double-click `tools/facetrack/Start face tracker.cmd`. The first run needs Python 3.12
    (python.org) and sets itself up, which takes a few minutes and about 300 MB.
-3. Calibrate once in the tracker's window: press **C** with lips relaxed and shut, **O** on a wide
-   "aah", **U** on an "oo", **E** on an "ee". This is saved for next time.
+3. Calibrate once: press **Space** in the tracker's window and follow the four poses it asks for
+   (rest, "aah", "oo", "ee"), pressing Space to capture each. This is saved for next time. The
+   window shows which poses are done; **R**, **A**, **U**, **E** redo one.
+4. Play a key once: the face sings on the last key you played.
 
-What the mouth does:
+What the face does:
 
+- **Vowel**: your jaw and lips drive the model's jaw and lips directly, and the pad only places
+  the tongue. Parting your lips starts the note, and the wider you open the louder it sings; a
+  mouth that snaps open attacks harder. Rounded lips sing "oo", spread lips "ee", and a smile
+  moves the vowel forward. Shut your lips on a note and it hums "m"; a quick shut-and-open gives
+  "b"; lower lip on the teeth gives "v" (or "f" with Whisper on). Lips kept shut for about half a
+  second end the note.
 - **Sing**: each time the mouth opens it sings the next syllable; opening again after closing
-  part way sings the next one legato; shutting the mouth ends the note.
-- **Vowel**: the mouth moves the pad (a spread mouth is "ee", rounded is "oo", the opening is how
-  open the vowel is) and opening it sounds the note.
-- **Creature**: opening the mouth plays a held note.
+  part way sings the next one legato; shutting the mouth ends the note. A wider mouth sings louder.
+- **Creature**: opening the mouth plays a held note, louder the wider it is. Eyebrows and smile
+  lean on the creature's first two knobs that are not its pitch.
+- **Everywhere**: tilting your head bends the pitch by up to two semitones either way (nothing
+  within about four degrees of upright). Raised eyebrows brighten and tighten the voice, lowered
+  ones darken it; outside Vowel mode a smile brightens it too.
 
-The face sings on the last key you played. The dot on the FACE button is green while a face is
-tracked, amber when the tracker runs but sees no face, blue when nothing is sending, and red
-when another Chimera already has face control (only one can listen at a time).
+In the tracker's window, **1**, **2** and **3** switch eyebrows, head tilt and smile off and on,
+**V** hides the video to save processor time, and **Q** quits. The meters show everything being
+sent.
+
+The dot on the FACE button is green while a face is tracked, amber when the tracker runs but sees
+no face, blue when nothing is sending, and red when another Chimera already has face control
+(only one can listen at a time).
 
 Expect the voice to trail the mouth by about a tenth of a second. Mouthing silently while
 listening to Chimera works better than speaking aloud with it, which sounds like an echo. A
@@ -98,6 +114,11 @@ dim room makes the camera slow down and adds delay, so light your face. The trac
 - Velocity sets how hard the voice breathes. Pitch bend, mod wheel (more vibrato) and the sustain
   pedal work. **Silence** stops everything.
 - **Eco** halves the human voice's processor use for a slightly duller sound.
+- **Help**: the **?** button, or **F1** while the plugin's window is the active one, opens a
+  one-page guide; **Full help** from there (or **Help** in the lyrics panel) is the whole manual.
+  F1 or Esc closes it.
+- **Window size**: drag the bottom-right corner. Everything scales with the window, and the size
+  is saved with the project. (The host cannot resize this kind of window by its edges.)
 
 Knobs: drag up and down, hold Shift for fine steps, double-click for the default.
 
@@ -116,11 +137,13 @@ Needs Rust (`rustup`, stable, MSVC toolchain).
 ```
 git submodule update --init
 ./install.ps1        # builds and copies "Chimera Voice.clap" to %LOCALAPPDATA%\Programs\Common\CLAP
-cargo test --release # plays test phrases, creatures, drums and made-up face frames; WAVs land in target/renders
+cargo test --release # plays test phrases, creatures, drums and made-up face frames, and clicks
+                     # through the editor without a window; WAVs land in target/renders
 ```
 
 `target/release/chimera_voice_standalone.exe` runs the plugin on its own with the system's audio
-and MIDI devices.
+and MIDI devices. For checking the layout, the environment variables `CHIMERA_UI_SCALE` (0.6 to
+2.5) and `CHIMERA_UI_HELP` (`quick` or `full`) open it at another size or on a help screen.
 
 ## Layout
 
@@ -128,8 +151,10 @@ and MIDI devices.
   live Sing controller). No plugin code: the tests drive it directly.
 - `src/lyrics.rs`: text → syllables (words, sound codes, IPA), with the dictionary built in.
 - `src/lib.rs`: the plugin (parameters, MIDI, audio callback).
-- `src/editor.rs`: the editor (egui).
-- `src/face.rs`: the face tracker's packets, the listener, and how frames become notes.
+- `src/editor.rs`: the editor (egui), drawn for 960 x 640 on a layer scaled to the window; the
+  help screens; keyboard handling.
+- `src/face.rs`: the face tracker's packets, the listener, and how frames become notes, mouth
+  shapes and expression.
 - `src/shared.rs`: what the audio thread, the editor and the background task share.
 - `tools/facetrack/`: the webcam tracker (Python, MediaPipe).
 

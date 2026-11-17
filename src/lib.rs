@@ -199,7 +199,11 @@ impl Default for ChimeraParams {
         phrases[0] = DEFAULT_LYRICS.to_string();
         let knob_defaults = performer::creature_defaults(performer::creature(0));
         Self {
-            editor_state: EguiState::from_size(editor::WIDTH, editor::HEIGHT),
+            editor_state: {
+                // CHIMERA_UI_SCALE opens the window at another size (for checking the layout)
+                let scale = std::env::var("CHIMERA_UI_SCALE").ok().and_then(|v| v.parse::<f32>().ok()).map_or(1.0, |v| v.clamp(0.6, 2.5));
+                EguiState::from_size((editor::WIDTH as f32 * scale).round() as u32, (editor::HEIGHT as f32 * scale).round() as u32)
+            },
             phrases: Arc::new(RwLock::new(phrases)),
 
             mode: EnumParam::new("Mode", ModeParam::Sing),
@@ -333,10 +337,12 @@ impl Default for ChimeraVoice {
 impl ChimeraVoice {
     fn tone(&self) -> Tone {
         let p = &self.params;
+        // the face adds to the knobs while it is tracked (nothing otherwise)
+        let e = self.face.expression();
         Tone {
-            pressure: p.breath.value() as f64,
-            tension: p.pressed.value() as f64,
-            brightness: p.bright.value() as f64,
+            pressure: (p.breath.value() as f64 * e.pressure).clamp(2.0, 26.0),
+            tension: (p.pressed.value() as f64 + e.tension).clamp(0.0, 1.0),
+            brightness: (p.bright.value() as f64 + e.bright).clamp(0.0, 1.0),
             breathiness: p.breathy.value() as f64,
             roughness: p.rough.value() as f64,
             fry: p.fry.value() as f64,
@@ -367,7 +373,7 @@ impl ChimeraVoice {
             NoteEvent::NoteOff { note, .. } | NoteEvent::Choke { note, .. } => perf.note_off(note),
             NoteEvent::MidiPitchBend { value, .. } => {
                 self.bend = (value as f64 * 2.0 - 1.0) * self.params.bend_range.value() as f64;
-                perf.set_bend(self.bend);
+                perf.set_bend(self.bend + self.face.expression().bend);
             }
             NoteEvent::MidiCC { cc, value, .. } => match cc {
                 1 => self.mod_wheel = value as f64,
@@ -520,10 +526,21 @@ impl Plugin for ChimeraVoice {
             } else {
                 self.face.release(perf);
             }
+            // a tilted head bends the pitch, on top of the wheel
+            let expression = self.face.expression();
+            perf.set_bend(self.bend + expression.bend);
             perf.set_key_action(self.params.keys.value().action());
             let mut knobs = [0.0; CREATURE_KNOBS];
             for (k, p) in knobs.iter_mut().zip(self.params.knobs.iter()) {
                 *k = p.value.value() as f64;
+            }
+            // the eyebrows and the smile lean on the creature's first two knobs that are not its pitch
+            if expression.brows != 0.0 || expression.smile != 0.0 {
+                let def = performer::creature(self.params.creature.value().index());
+                let free = performer::creature_knobs(def).enumerate().filter(|(_, (_, p))| p.role.is_none()).map(|(k, _)| k);
+                for (k, lean) in free.zip([0.3 * expression.brows, 0.3 * expression.smile]) {
+                    knobs[k] = (knobs[k] + lean).clamp(0.0, 1.0);
+                }
             }
             perf.set_knobs(&knobs);
 

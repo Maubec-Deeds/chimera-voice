@@ -642,6 +642,7 @@ dependencies = [
  "nih_plug_egui",
  "parking_lot",
  "rfd",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

@@ -376,7 +376,12 @@ struct State {
     last_cursor: i64,
     last_phrase: i64,
     level: f32,
-    help: bool,
+    help: Help,
+    /// the editor's own window, once the pointer has been over it (0: not known yet)
+    window: isize,
+    f1_down: bool,
+    /// the lyrics are being typed: the window holds the keyboard
+    typing: bool,
     /// how lit each drum pad is
     flash: [f32; 10],
     beat_count: u32,
@@ -404,8 +409,8 @@ impl State {
     }
 }
 
-pub fn create(params: Arc<ChimeraParams>, shared: Arc<Shared>) -> Option<Box<dyn Editor>> {
-    let state = State {
+fn new_state(shared: &Shared) -> State {
+    State {
         head: Head::new(BodyMix::MALE),
         slot: 0,
         phrases: vec![String::new(); PHRASES],
@@ -415,44 +420,323 @@ pub fn create(params: Arc<ChimeraParams>, shared: Arc<Shared>) -> Option<Box<dyn
         last_cursor: -1,
         last_phrase: -1,
         level: 0.0,
-        help: false,
+        // CHIMERA_UI_HELP opens on a help screen (for checking the layout)
+        help: match std::env::var("CHIMERA_UI_HELP").as_deref() {
+            Ok("quick") => Help::Quick,
+            Ok("full") => Help::Full,
+            _ => Help::Closed,
+        },
+        window: 0,
+        f1_down: false,
+        typing: false,
         flash: [0.0; 10],
         beat_count: shared.beat_count.load(Ordering::Relaxed),
         hint: "",
         face_packets: 0,
         face_last: None,
         face_seen: f64::INFINITY,
-    };
-    create_egui_editor(
-        params.editor_state.clone(),
-        state,
-        |ctx, _| {
-            let mut fonts = egui::FontDefinitions::default();
-            fonts.font_data.insert("hershey".into(), Arc::new(egui::FontData::from_static(HERSHEY)));
-            // the system's own font, for the phonetic symbols the built-in ones lack
-            if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
-                fonts.font_data.insert("system".into(), Arc::new(egui::FontData::from_owned(bytes)));
-                fonts.families.entry(FontFamily::Proportional).or_default().push("system".into());
+    }
+}
+
+/// The fonts and colours.
+fn style(ctx: &egui::Context) {
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert("hershey".into(), Arc::new(egui::FontData::from_static(HERSHEY)));
+    // the system's own font, for the phonetic symbols the built-in ones lack
+    if let Ok(bytes) = std::fs::read("C:\\Windows\\Fonts\\segoeui.ttf") {
+        fonts.font_data.insert("system".into(), Arc::new(egui::FontData::from_owned(bytes)));
+        fonts.families.entry(FontFamily::Proportional).or_default().push("system".into());
+    }
+    let mut stack = vec!["hershey".to_string()];
+    stack.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
+    fonts.families.insert(FontFamily::Name("hershey".into()), stack);
+    ctx.set_fonts(fonts);
+    let mut v = egui::Visuals::dark();
+    v.panel_fill = BG;
+    v.extreme_bg_color = BG;
+    v.selection.bg_fill = alpha(BLUE, 0.35);
+    v.selection.stroke = Stroke::new(1.0_f32, BLUE);
+    v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, FRAME);
+    v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE_MID);
+    v.override_text_color = Some(TEXT);
+    v.resize_corner_size = 18.0;
+    ctx.set_visuals(v);
+}
+
+/// One frame of the editor.
+fn frame(ctx: &egui::Context, params: &ChimeraParams, shared: &Arc<Shared>, setter: &ParamSetter, st: &mut State) {
+    ctx.request_repaint();
+    nih_plug_egui::resizable_window::ResizableWindow::new("chimera-window").min_size(MIN_SIZE).show(ctx, &params.editor_state, |ui| {
+        // everything is laid out for 960 x 640 and drawn on a layer scaled to the window
+        let screen = ui.ctx().screen_rect();
+        let scale = (screen.width() / WIDTH as f32).min(screen.height() / HEIGHT as f32).max(0.25);
+        let layer = egui::LayerId::new(ui.layer_id().order, egui::Id::new("chimera-scaled"));
+        // a layer of the panel's own, so that its widgets take clicks
+        ctx.set_sublayer(ui.layer_id(), layer);
+        ctx.set_transform_layer(layer, egui::emath::TSTransform::from_scaling(scale));
+        let design = Rect::from_min_size(Pos2::ZERO, vec2(WIDTH as f32, HEIGHT as f32));
+        let mut scaled = ui.new_child(egui::UiBuilder::new().layer_id(layer).max_rect(design));
+        scaled.set_clip_rect(design);
+        keyboard(ctx, st);
+        draw(&mut scaled, &params, &shared, setter, st);
+        resize_grip(&scaled, design);
+    });
+}
+
+pub fn create(params: Arc<ChimeraParams>, shared: Arc<Shared>) -> Option<Box<dyn Editor>> {
+    let state = new_state(&shared);
+    create_egui_editor(params.editor_state.clone(), state, |ctx, _| style(ctx), move |ctx, setter, st| frame(ctx, &params, &shared, setter, st))
+}
+
+// ---------------------------------------------------------------------- window, keyboard, help
+
+/// Which help is open: none, the one-page guide (F1), or the full help.
+#[derive(Clone, Copy, PartialEq)]
+enum Help {
+    Closed,
+    Quick,
+    Full,
+}
+
+/// The smallest the window may be dragged to.
+const MIN_SIZE: (f32, f32) = (576.0, 384.0);
+
+/// Mark the corner that resizes the window (the dragging itself is the wrapper's: the host
+/// cannot resize this kind of window by its edges, so the plugin asks for the new size).
+fn resize_grip(ui: &egui::Ui, design: Rect) {
+    let p = ui.painter();
+    for k in 1..=3 {
+        let d = 3.5 * k as f32;
+        p.line_segment([pos2(design.right() - 1.5 - d, design.bottom() - 1.5), pos2(design.right() - 1.5, design.bottom() - 1.5 - d)], Stroke::new(1.2_f32, BLUE));
+    }
+}
+
+/// Keys the host does not hand to a plugin window by itself. F1 opens the guide whenever the
+/// plugin's window is the active one. While the lyrics are being typed the window takes the
+/// keyboard, and gives it back afterwards so the host's own shortcuts (space to play) work.
+#[cfg(windows)]
+fn keyboard(ctx: &egui::Context, st: &mut State) {
+    use windows_sys::Win32::Foundation::{HWND, POINT};
+    use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, GetFocus, SetFocus, VK_ESCAPE, VK_F1};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetAncestor, GetClassNameW, GetCursorPos, GetForegroundWindow, GetParent, GetWindowThreadProcessId, IsWindow, WindowFromPoint, GA_ROOT};
+    // SAFETY: plain Win32 queries on window handles, on the thread that owns the editor's window
+    unsafe {
+        let ours = |w: HWND| {
+            if w.is_null() || IsWindow(w) == 0 || GetWindowThreadProcessId(w, std::ptr::null_mut()) != GetCurrentThreadId() {
+                return false;
             }
-            let mut stack = vec!["hershey".to_string()];
-            stack.extend(fonts.families.get(&FontFamily::Proportional).cloned().unwrap_or_default());
-            fonts.families.insert(FontFamily::Name("hershey".into()), stack);
-            ctx.set_fonts(fonts);
-            let mut v = egui::Visuals::dark();
-            v.panel_fill = BG;
-            v.extreme_bg_color = BG;
-            v.selection.bg_fill = alpha(BLUE, 0.35);
-            v.selection.stroke = Stroke::new(1.0_f32, BLUE);
-            v.widgets.inactive.bg_stroke = Stroke::new(1.0_f32, FRAME);
-            v.widgets.hovered.bg_stroke = Stroke::new(1.0_f32, BLUE_MID);
-            v.override_text_color = Some(TEXT);
-            ctx.set_visuals(v);
-        },
-        move |ctx, setter, st| {
-            ctx.request_repaint();
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(BG)).show(ctx, |ui| draw(ui, &params, &shared, setter, st));
-        },
-    )
+            // the editor's window is one of the windowing library's
+            let mut name = [0u16; 32];
+            let n = GetClassNameW(w, name.as_mut_ptr(), name.len() as i32).max(0) as usize;
+            String::from_utf16_lossy(&name[..n]).starts_with("Baseview")
+        };
+        if !ours(st.window as HWND) {
+            st.window = 0;
+            // the window under the pointer is the editor's while the pointer is over the editor
+            if ctx.input(|i| i.pointer.has_pointer()) {
+                let mut pt = POINT { x: 0, y: 0 };
+                if GetCursorPos(&mut pt) != 0 {
+                    let w = WindowFromPoint(pt);
+                    if ours(w) {
+                        st.window = w as isize;
+                    }
+                }
+            }
+        }
+        if st.window == 0 {
+            return;
+        }
+        let window = st.window as HWND;
+        let front = GetForegroundWindow() == GetAncestor(window, GA_ROOT);
+        let focus = GetFocus();
+        if st.typing && front && focus != window {
+            SetFocus(window);
+        } else if !st.typing && focus == window {
+            let parent = GetParent(window);
+            if !parent.is_null() {
+                SetFocus(parent);
+            }
+        }
+        let pressed = |key: u16| front && (GetAsyncKeyState(key as i32) as u16 & 0x8000) != 0;
+        let f1 = pressed(VK_F1);
+        if f1 && !st.f1_down {
+            st.help = if st.help == Help::Closed { Help::Quick } else { Help::Closed };
+        }
+        st.f1_down = f1;
+        if pressed(VK_ESCAPE) {
+            st.help = Help::Closed;
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn keyboard(ctx: &egui::Context, st: &mut State) {
+    if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+        st.help = if st.help == Help::Closed { Help::Quick } else { Help::Closed };
+    }
+    if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+        st.help = Help::Closed;
+    }
+}
+
+/// The one-page guide: (heading, colour, lines).
+const QUICK: &[(&str, Color32, &[&str])] = &[
+    ("PLAY", BLUE, &["One voice, one note at a time. Play a key and it sings.", "Pick what the keys do with the four buttons at the top: SING, VOWEL, CREATURE, BEATBOX."]),
+    ("SING", GREEN, &["Click the big box and type words. Each note sings the next syllable.", "Buttons 1 to 8 are eight phrases. FROM THE TOP starts the phrase again."]),
+    ("VOWEL", PINK, &["Keys sing the vowel under the pink handle. Drag it while you play."]),
+    ("CREATURE", AMBER, &["Keys play an animal. Choose one in BESTIARY, and what the keys do under THE KEYS PLAY."]),
+    ("BEATBOX", RED, &["Keys from C1 play mouth drums. Other keys hum a bass note. Click a pad to hear it."]),
+    ("FACE", GREEN, &["Turn on FACE and start the face tracker: your mouth, eyebrows and head tilt play the voice.", "See FACE CONTROL in the full help."]),
+    ("SOUND", AMBER, &["BODY: man, woman or child. The knobs shape the voice. ECO halves the processor load.", "SILENCE stops everything."]),
+    ("WINDOW", BLUE, &["Drag the bottom-right corner to resize the window."]),
+];
+
+/// The full help: (section, colour, paragraphs). A paragraph starting with "- " is a list item.
+const FULL: &[(&str, Color32, &[&str])] = &[
+    (
+        "GETTING STARTED",
+        BLUE,
+        &[
+            "Chimera Voice is one singer: it plays one note at a time. Put it on an instrument track and play keys or draw notes. The four buttons at the top choose what the keys do.",
+            "The picture on the left is the inside of the head: tongue (green), jaw (red), lips (pink), soft palate (white). It moves as the voice sings.",
+            "The voice is a physical model and is heavy on the processor. If the sound breaks up, turn on ECO, raise the audio buffer size in your host, or close other programs.",
+        ],
+    ),
+    (
+        "SING: LYRICS",
+        GREEN,
+        &[
+            "Click the large box under PHRASE and type the words. Each note sings the next syllable; the syllables appear as chips below the box. Amber is sounding, green sings next. Click a chip to start from it.",
+            "While you type, the plugin has the keyboard. Click anywhere outside the box to give the keyboard back to your host (so the space bar starts playback again).",
+            "PASTE takes the text on the clipboard. LOAD FILE reads a text file.",
+            "FROM THE TOP goes back to the first syllable. RESTART WHEN PLAY STARTS does that each time the host starts playing.",
+            "Overlapping notes sing legato. The sustain pedal holds a note.",
+        ],
+    ),
+    (
+        "VOWEL",
+        PINK,
+        &[
+            "Keys sing the vowel under the handle on the pad. Left to right is the tongue from front (\"ee\") to back (\"oo\"); top to bottom is the mouth from shut to open (\"aa\"). Drag the handle while you play, or automate Vowel Front-Back and Vowel Close-Open.",
+        ],
+    ),
+    (
+        "CREATURE",
+        AMBER,
+        &[
+            "Keys play an animal's voice box instead of a human one. Choose the animal under BESTIARY.",
+            "THE KEYS PLAY chooses between HELD NOTE (the creature sounds for as long as the key is down, at the key's pitch) and its calls (each key plays the whole call at that pitch).",
+            "The eight knobs change with the creature. Changing creature takes about a third of a second of silence.",
+        ],
+    ),
+    (
+        "BEATBOX",
+        RED,
+        &[
+            "Every drum is the mouth making it. The keys from C1 play the drums shown on the pads; any other key hums a bass note for as long as it is held. Click a pad to hear it.",
+        ],
+    ),
+    (
+        "FACE CONTROL",
+        GREEN,
+        &[
+            "A webcam watches your face and Chimera follows it. Nothing leaves the computer and no pictures are saved.",
+            "1. Turn on FACE in the top bar.",
+            "2. Start the tracker: double-click \"Start face tracker.cmd\" in the tools/facetrack folder of the Chimera project. The first run sets itself up, which takes a few minutes.",
+            "3. In the tracker's window press SPACE and follow the four poses (rest, \"aah\", \"oo\", \"ee\"). This is saved.",
+            "4. Play a key once: the face sings on the last key you played.",
+            "The dot on the FACE button: green is tracking, amber means the tracker sees no face, blue means no tracker is running, red means another Chimera already has the tracker.",
+            "What your face does:",
+            "- VOWEL: your lips and jaw are the model's lips and jaw. Parting your lips starts the note, and the wider you open the louder it sings. Rounded lips sing \"oo\", spread lips \"ee\", and a smile moves the vowel forward. Shut your lips on a note and it hums \"m\"; a quick shut and open gives \"b\". Lower lip on your teeth gives \"v\". Lips kept shut end the note.",
+            "- SING: each time your mouth opens it sings the next syllable of the lyrics. Opening wider sings louder. Shutting your mouth ends the note.",
+            "- CREATURE: opening your mouth plays a held note, louder the wider it is. Eyebrows and smile lean on the creature's first two knobs.",
+            "- Everywhere: tilting your head bends the pitch up or down by up to two semitones. Raised eyebrows brighten and tighten the voice; lowered ones darken it.",
+            "In the tracker's window, keys 1, 2 and 3 switch eyebrows, head tilt and smile off and on if you do not want them.",
+            "A camera cannot see the tongue, so sounds made with it (t, d, s, l, k) cannot be read from the face. The voice trails your mouth by about a tenth of a second. Light your face well: a dim room slows the camera.",
+        ],
+    ),
+    (
+        "EVERYWHERE",
+        BLUE,
+        &[
+            "- BODY: man, woman, child, or anywhere between. OCTAVE shifts the keyboard.",
+            "- VOICE knobs: BREATH (lung pressure, so loudness), PRESSED, BRIGHT, BREATHY, ROUGH, FRY. WHISPER is on the body panel.",
+            "- PITCH knobs: VIBRATO depth and RATE, GLIDE, DRIFT (human pitch wander), BEND range.",
+            "- Velocity sets how hard the voice breathes. Pitch bend, the mod wheel (more vibrato) and the sustain pedal work.",
+            "- SILENCE stops everything. ECO halves the human voice's processor use for a slightly duller sound.",
+            "- The window: drag the bottom-right corner to resize it. Everything scales with it, and the size is saved with the project.",
+            "- F1 opens the quick guide while the plugin's window is the active one.",
+        ],
+    ),
+];
+
+/// The help, over the whole window: the guide (F1) or the full help.
+fn draw_help_screen(ui: &mut egui::Ui, rect: Rect, st: &mut State) {
+    st.typing = false;
+    panel(ui.painter(), rect, "");
+    let quick = st.help == Help::Quick;
+    ui.painter().text(rect.left_top() + vec2(18.0, 24.0), Align2::LEFT_CENTER, if quick { "QUICK GUIDE" } else { "HELP" }, vfont(20.0), BLUE);
+    if toggle(ui, Rect::from_min_size(pos2(rect.right() - 98.0, rect.top() + 11.0), vec2(84.0, 26.0)), "CLOSE", false, WHITE) {
+        st.help = Help::Closed;
+    }
+    let other = Rect::from_min_size(pos2(rect.right() - 236.0, rect.top() + 11.0), vec2(130.0, 26.0));
+    if toggle(ui, other, if quick { "FULL HELP" } else { "QUICK GUIDE" }, false, GREEN) {
+        st.help = if quick { Help::Full } else { Help::Quick };
+    }
+    ui.painter().text(pos2(other.left() - 14.0, rect.top() + 24.0), Align2::RIGHT_CENTER, "F1 or Esc closes", vfont(10.5), BLUE_DIM);
+    let body = Rect::from_min_max(rect.min + vec2(18.0, 50.0), rect.max - vec2(14.0, 12.0));
+    let text = |s: &str, color: Color32| egui::RichText::new(s).color(color).font(FontId::proportional(14.0));
+    if quick {
+        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(body), |ui| {
+            ui.spacing_mut().item_spacing.y = 5.0;
+            for (head, color, lines) in QUICK {
+                ui.add_space(7.0);
+                ui.horizontal_top(|ui| {
+                    ui.allocate_ui_with_layout(vec2(96.0, 18.0), egui::Layout::left_to_right(egui::Align::Min), |ui| {
+                        ui.set_min_width(96.0);
+                        ui.label(egui::RichText::new(*head).color(*color).font(vfont(13.0)));
+                    });
+                    ui.vertical(|ui| {
+                        for line in *lines {
+                            ui.label(text(line, alpha(TEXT, 0.92)));
+                        }
+                    });
+                });
+            }
+        });
+        return;
+    }
+    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(body), |ui| {
+        egui::ScrollArea::vertical().id_salt("full-help").auto_shrink([false, false]).show(ui, |ui| {
+            ui.set_max_width(body.width() - 22.0);
+            ui.spacing_mut().item_spacing.y = 6.0;
+            for (head, color, paragraphs) in FULL {
+                ui.add_space(8.0);
+                ui.label(egui::RichText::new(*head).color(*color).font(vfont(14.0)));
+                for para in *paragraphs {
+                    match para.strip_prefix("- ") {
+                        Some(item) => {
+                            ui.horizontal_top(|ui| {
+                                ui.add_space(8.0);
+                                ui.label(text("-", *color));
+                                ui.add(egui::Label::new(text(item, alpha(TEXT, 0.9))).wrap());
+                            });
+                        }
+                        None => {
+                            ui.add(egui::Label::new(text(para, alpha(TEXT, 0.9))).wrap());
+                        }
+                    }
+                }
+                if *head == "SING: LYRICS" {
+                    ui.add_space(2.0);
+                    ui.label(text("Writing lyrics:", BLUE_MID));
+                    draw_lyric_help(ui);
+                }
+            }
+            ui.add_space(12.0);
+        });
+    });
 }
 
 fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter: &ParamSetter, st: &mut State) {
@@ -487,6 +771,13 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         st.last_phrase = phrase;
     }
     let mode = params.mode.value();
+    if st.help != Help::Closed {
+        draw_help_screen(ui, full.shrink(m), st);
+        return;
+    }
+    if mode != ModeParam::Sing {
+        st.typing = false;
+    }
 
     // ---- top bar
     let top = Rect::from_min_size(full.min + vec2(m, m), vec2(full.width() - 2.0 * m, 40.0));
@@ -497,7 +788,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
     }
     let modes = [(ModeParam::Sing, "SING", GREEN), (ModeParam::Vowel, "VOWEL", PINK), (ModeParam::Creature, "CREATURE", AMBER), (ModeParam::Beatbox, "BEATBOX", RED)];
     for (i, (which, name, color)) in modes.into_iter().enumerate() {
-        let r = Rect::from_min_size(pos2(top.left() + 196.0 + 100.0 * i as f32, top.top() + 6.0), vec2(94.0, 28.0));
+        let r = Rect::from_min_size(pos2(top.left() + 196.0 + 92.0 * i as f32, top.top() + 6.0), vec2(87.0, 28.0));
         if toggle(ui, r, name, mode == which, color) {
             set(setter, &params.mode, which);
         }
@@ -505,7 +796,10 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
     if toggle(ui, Rect::from_min_size(pos2(top.right() - 84.0, top.top() + 6.0), vec2(84.0, 28.0)), "SILENCE", false, RED) {
         shared.panic.store(true, Ordering::Release);
     }
-    // half the processor time for a slightly duller voice
+    if toggle(ui, Rect::from_min_size(pos2(top.right() - 250.0, top.top() + 6.0), vec2(28.0, 28.0)), "?", false, WHITE) {
+        st.help = Help::Quick;
+    }
+    ui.interact(Rect::from_min_size(pos2(top.right() - 250.0, top.top() + 6.0), vec2(28.0, 28.0)), ui.id().with("help-tip"), Sense::hover()).on_hover_text("Quick guide (F1)");
     // follow a webcam face tracker (tools/facetrack); the dot says whether it is sending
     let face_rect = Rect::from_min_size(pos2(top.right() - 216.0, top.top() + 6.0), vec2(58.0, 28.0));
     if toggle(ui, face_rect, "FACE", params.face.value(), GREEN) {
@@ -535,6 +829,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         ui.painter().circle_filled(dot, 3.5, color);
         ui.interact(face_rect, ui.id().with("face-tip"), Sense::hover()).on_hover_text(tip);
     }
+    // half the processor time for a slightly duller voice
     if toggle(ui, Rect::from_min_size(pos2(top.right() - 150.0, top.top() + 6.0), vec2(58.0, 28.0)), "ECO", params.eco.value(), AMBER) {
         set(setter, &params.eco, !params.eco.value());
     }
@@ -542,7 +837,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         let p = ui.painter();
         let singing = voicing > 0.2 && st.level > 0.003;
         let pitch = if singing { format!("{}  {:.0} Hz", note_name(f0), f0) } else { "--".to_string() };
-        p.text(pos2(top.right() - 232.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
+        p.text(pos2(top.right() - 260.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
     }
 
     // ---- left: the head or the creature's airway, then the body or the bestiary
@@ -661,7 +956,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         ModeParam::Sing => draw_lyrics(ui, main, params, shared, setter, st),
         ModeParam::Vowel => {
             let face = (params.face.value() && st.face_seen < 0.5).then(|| shared.face.load()).filter(|f| f.present);
-            draw_pad(ui, main, params, setter, face.map(|f| crate::face::pad_from_face(f.opening, f.rounding)))
+            draw_pad(ui, main, params, setter, face)
         }
         ModeParam::Creature => draw_creature(ui, main, params, setter, st),
         ModeParam::Beatbox => draw_beatbox(ui, main, shared, st),
@@ -752,8 +1047,8 @@ fn draw_lyrics(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, shared: &A
     }
     // other ways in than typing
     let bx = rect.right() - 10.0;
-    if toggle(ui, Rect::from_min_size(pos2(bx - 56.0, rect.top() + 5.0), vec2(56.0, 22.0)), "HELP", st.help, WHITE) {
-        st.help = !st.help;
+    if toggle(ui, Rect::from_min_size(pos2(bx - 56.0, rect.top() + 5.0), vec2(56.0, 22.0)), "HELP", false, WHITE) {
+        st.help = Help::Full;
     }
     if toggle(ui, Rect::from_min_size(pos2(bx - 142.0, rect.top() + 5.0), vec2(80.0, 22.0)), "LOAD FILE", false, GREEN) {
         // the dialog runs on its own thread, so the host's window keeps drawing behind it
@@ -782,32 +1077,38 @@ fn draw_lyrics(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, shared: &A
     let edit_rect = Rect::from_min_max(rect.min + vec2(10.0, 32.0), pos2(rect.right() - 10.0, rect.top() + 32.0 + (rect.height() - 78.0) * 0.46));
     let chips_rect = Rect::from_min_max(pos2(rect.left() + 10.0, edit_rect.bottom() + 8.0), pos2(rect.right() - 10.0, rect.bottom() - 38.0));
 
-    if st.help {
-        let help_rect = Rect::from_min_max(edit_rect.min, chips_rect.max);
-        ui.allocate_new_ui(egui::UiBuilder::new().max_rect(help_rect), |ui| {
-            egui::ScrollArea::vertical().id_salt("help").auto_shrink([false, false]).show(ui, draw_help);
-        });
-        draw_lyrics_footer(ui, rect, params, shared, setter, st);
-        return;
-    }
     ui.painter().rect_filled(edit_rect, 4.0, BG);
-    ui.painter().rect_stroke(edit_rect, 4.0, Stroke::new(1.0_f32, FRAME), StrokeKind::Inside);
+    ui.painter().rect_stroke(edit_rect, 4.0, Stroke::new(1.0_f32, if st.typing { GREEN } else { FRAME }), StrokeKind::Inside);
     let slot = st.slot;
+    // a click in the box starts typing (the window takes the keyboard); a click elsewhere ends it
+    if ui.input(|i| i.pointer.any_pressed()) {
+        // the pointer, in this (scaled) layer's own coordinates
+        let from_window = ui.ctx().layer_transform_from_global(ui.layer_id());
+        let at = ui.input(|i| i.pointer.interact_pos()).map(|p| from_window.map_or(p, |t| t * p));
+        st.typing = at.is_some_and(|p| edit_rect.contains(p));
+    }
+    let typing = st.typing;
     let changed = ui
         .allocate_new_ui(egui::UiBuilder::new().max_rect(edit_rect.shrink(4.0)), |ui| {
             egui::ScrollArea::vertical()
                 .id_salt(("lyrics-edit", slot))
                 .show(ui, |ui| {
-                    ui.add(
+                    let resp = ui.add(
                         egui::TextEdit::multiline(&mut st.phrases[slot])
                             .id_salt(("lyrics-text", slot))
                             .frame(false)
                             .desired_width(f32::INFINITY)
                             .desired_rows(4)
                             .font(FontId::proportional(15.0))
-                            .hint_text("Type the words to sing, or use Paste or Load file. Each note sings the next syllable."),
-                    )
-                    .changed()
+                            .hint_text("Click here and type the words to sing (or use Paste or Load file). Each note sings the next syllable."),
+                    );
+                    // the box keeps the keys for as long as the lyrics are being typed
+                    if typing && !resp.has_focus() {
+                        resp.request_focus();
+                    } else if !typing && resp.has_focus() {
+                        resp.surrender_focus();
+                    }
+                    resp.changed()
                 })
                 .inner
         })
@@ -880,7 +1181,8 @@ fn draw_lyrics_footer(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, sha
     }
 }
 
-fn draw_help(ui: &mut egui::Ui) {
+/// How to write lyrics, and the sound codes.
+fn draw_lyric_help(ui: &mut egui::Ui) {
     let line = |ui: &mut egui::Ui, head: &str, body: &str| {
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing.x = 6.0;
@@ -905,9 +1207,27 @@ fn draw_help(ui: &mut egui::Ui) {
 
 // ---------------------------------------------------------------------- vowel
 
-/// `face`: where the face tracker has the handle, while it does.
-fn draw_pad(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, setter: &ParamSetter, face: Option<(f64, f64)>) {
-    panel(ui.painter(), rect, "VOWEL  -  drag to shape the mouth while you play");
+/// `face`: the face tracker's frame, while a face is tracked (it has the handle then).
+fn draw_pad(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, setter: &ParamSetter, face: Option<crate::face::Frame>) {
+    panel(ui.painter(), rect, if face.is_some() { "VOWEL  -  your face is shaping the mouth" } else { "VOWEL  -  drag to shape the mouth while you play" });
+    if let Some(f) = face.filter(|f| f.detail) {
+        // what else the face is sending: lips shut, lip on teeth, eyebrows, head tilt, smile
+        use crate::face::{BROWS, CLOSED, SMILE, TEETH, TILT};
+        let p = ui.painter();
+        for (i, (name, which, centred, color)) in [("M B", CLOSED, false, GREEN), ("F V", TEETH, false, GREEN), ("BROWS", BROWS, true, BLUE), ("TILT", TILT, true, BLUE), ("SMILE", SMILE, false, PINK)].into_iter().enumerate() {
+            let bar = Rect::from_min_size(pos2(rect.right() - 300.0 + 59.0 * i as f32, rect.top() + 19.0), vec2(50.0, 5.0));
+            p.text(bar.center_top() + vec2(0.0, -2.0), Align2::CENTER_BOTTOM, name, vfont(9.0), BLUE_MID);
+            p.rect_stroke(bar, 2.0, Stroke::new(1.0_f32, FRAME), StrokeKind::Outside);
+            let v = f.get(which) as f32;
+            let fill = if centred {
+                Rect::from_x_y_ranges(egui::Rangef::new(bar.center().x.min(bar.center().x + 25.0 * v), bar.center().x.max(bar.center().x + 25.0 * v)), bar.y_range())
+            } else {
+                Rect::from_min_size(bar.min, vec2(50.0 * v.clamp(0.0, 1.0), 5.0))
+            };
+            p.rect_filled(fill, 1.0, color);
+        }
+    }
+    let face = face.map(|f| crate::face::pad_from_frame(&f));
     let pad = Rect::from_min_max(rect.min + vec2(44.0, 44.0), rect.max - vec2(44.0, 30.0));
     let resp = ui.interact(pad.expand(16.0), ui.id().with("vowel-pad"), Sense::click_and_drag());
     if resp.drag_started() {
@@ -1055,4 +1375,136 @@ fn draw_beatbox(ui: &mut egui::Ui, rect: Rect, shared: &Shared, st: &mut State) 
     }
     let line = if hint.is_empty() { "Click a pad to hear it. The keys from C1 play the drums; other keys hum a bass note." } else { st.hint };
     ui.painter().text(pos2(rect.left() + 12.0, rect.bottom() - 17.0), Align2::LEFT_CENTER, line, FontId::proportional(13.0), alpha(TEXT, 0.85));
+}
+
+// ---------------------------------------------------------------------- tests
+
+/// The editor driven without a window: clicks and keys go in as egui events, at several window
+/// sizes, so the scaled layout is known to take them where it is drawn.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use parking_lot::Mutex;
+
+    /// A host that only notes which parameter values the editor set.
+    #[derive(Default)]
+    struct NoHost {
+        set: Mutex<Vec<f32>>,
+    }
+
+    impl GuiContext for NoHost {
+        fn plugin_api(&self) -> PluginApi {
+            PluginApi::Standalone
+        }
+        fn request_resize(&self) -> bool {
+            true
+        }
+        unsafe fn raw_begin_set_parameter(&self, _param: ParamPtr) {}
+        unsafe fn raw_set_parameter_normalized(&self, _param: ParamPtr, normalized: f32) {
+            self.set.lock().push(normalized);
+        }
+        unsafe fn raw_end_set_parameter(&self, _param: ParamPtr) {}
+        fn get_state(&self) -> PluginState {
+            unimplemented!()
+        }
+        fn set_state(&self, _state: PluginState) {}
+    }
+
+    struct Rig {
+        ctx: egui::Context,
+        params: Arc<ChimeraParams>,
+        shared: Arc<Shared>,
+        host: NoHost,
+        st: State,
+        scale: f32,
+        time: f64,
+    }
+
+    impl Rig {
+        fn new(scale: f32) -> Rig {
+            let ctx = egui::Context::default();
+            style(&ctx);
+            let shared = Arc::new(Shared::new());
+            let st = new_state(&shared);
+            let mut rig = Rig { ctx, params: Arc::new(ChimeraParams::default()), shared, host: NoHost::default(), st, scale, time: 0.0 };
+            rig.run(vec![]);
+            rig.run(vec![]);
+            rig
+        }
+
+        fn run(&mut self, events: Vec<egui::Event>) {
+            let size = vec2(WIDTH as f32 * self.scale, HEIGHT as f32 * self.scale);
+            let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), time: Some(self.time), events, focused: true, ..Default::default() };
+            self.time += 1.0 / 60.0;
+            let setter = ParamSetter::new(&self.host);
+            let (params, shared, st) = (&self.params, &self.shared, &mut self.st);
+            let _ = self.ctx.run(raw, |ctx| frame(ctx, params, shared, &setter, st));
+        }
+
+        /// Click at a place in the 960 x 640 design, wherever the window's size puts it.
+        fn click(&mut self, x: f32, y: f32) {
+            let pos = pos2(x * self.scale, y * self.scale);
+            let button = |pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            // unhurried: clicks in quick succession would count as a double or triple click
+            self.time += 1.0;
+            self.run(vec![egui::Event::PointerMoved(pos)]);
+            self.run(vec![]);
+            self.run(vec![button(true)]);
+            self.run(vec![]);
+            self.run(vec![button(false)]);
+            self.run(vec![]);
+        }
+
+        fn type_text(&mut self, text: &str) {
+            self.run(vec![egui::Event::Text(text.to_string())]);
+            self.run(vec![]);
+        }
+    }
+
+    #[test]
+    fn the_window_takes_clicks_and_typing_at_any_size() {
+        for scale in [1.0, 0.6, 1.5, 2.0] {
+            let mut r = Rig::new(scale);
+            // a mode button: VOWEL is the second of four
+            r.click(343.0, 32.0);
+            assert_eq!(r.host.set.lock().last().copied(), Some(1.0 / 3.0), "the VOWEL button did nothing at {scale}x");
+            // the guide opens from its button and closes from its own
+            assert!(r.st.help == Help::Closed);
+            r.click(712.0, 32.0);
+            assert!(r.st.help == Help::Quick, "the ? button did not open the guide at {scale}x");
+            r.click(772.0, 36.0);
+            assert!(r.st.help == Help::Full, "FULL HELP did not open at {scale}x");
+            r.click(892.0, 36.0);
+            assert!(r.st.help == Help::Closed, "CLOSE did not close the help at {scale}x");
+            // a click in the lyric box starts typing, and the keys land in the phrase
+            let before = r.st.phrases[0].clone();
+            assert!(!r.st.typing);
+            r.click(700.0, 170.0);
+            assert!(r.st.typing, "a click in the lyric box did not start typing at {scale}x");
+            r.type_text(" la la");
+            assert!(r.st.phrases[0].contains(" la la") && r.st.phrases[0].len() == before.len() + 6, "typing did not reach the lyrics at {scale}x: {:?} after {before:?}", r.st.phrases[0]);
+            assert_eq!(*r.params.phrases.read(), r.st.phrases, "typed lyrics are kept with the project");
+            // a click elsewhere ends it: keys no longer change the lyrics
+            let typed = r.st.phrases[0].clone();
+            r.click(150.0, 300.0);
+            assert!(!r.st.typing);
+            r.type_text("zzz");
+            assert_eq!(r.st.phrases[0], typed, "keys still reach the lyrics after clicking away at {scale}x");
+        }
+    }
+
+    #[test]
+    fn every_mode_and_both_helps_draw_at_any_size() {
+        // nothing panics and nothing is laid out for a window that is not there
+        for scale in [0.6, 1.0, 2.5] {
+            let mut r = Rig::new(scale);
+            for x in [251.0, 343.0, 435.0, 527.0] {
+                r.click(x, 32.0);
+            }
+            for help in [Help::Quick, Help::Full, Help::Closed] {
+                r.st.help = help;
+                r.run(vec![]);
+            }
+        }
+    }
 }
