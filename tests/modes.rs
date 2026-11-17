@@ -170,6 +170,11 @@ fn lyrics_can_be_spelled_in_sounds() {
     assert!(!lyrics::problems("{HH QQ}").is_empty());
     // an unclosed bracket does not lose the words before it
     assert_eq!(lyrics::parse("la la {L AA").len(), 3);
+    // an underscore is a space (for hosts that keep the space bar), in all three spellings
+    for (a, b) in [("hello_there_world", "hello there world"), ("{HH_AH_L_OW_/_W_ER_L_D}", "{HH AH L OW / W ER L D}"), ("[həloʊ_wɝld]", "[həloʊ wɝld]")] {
+        assert_eq!(text(a), text(b), "{a}");
+    }
+    assert!(lyrics::problems("{HH_AH_L_OW}").is_empty());
 
     // and it sings
     let mut p = Performer::new(FS);

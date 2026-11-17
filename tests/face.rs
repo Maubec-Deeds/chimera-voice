@@ -4,6 +4,7 @@
 use chimera_voice::face::{self, Follower, Frame, Listener, State};
 use chimera_voice::lyrics;
 use chimera_voice::performer::{Mode, Performer};
+use chimera_voice::routes;
 use std::net::UdpSocket;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
@@ -121,8 +122,8 @@ impl Rig {
                 self.frame.seq += 1;
             }
             self.follower.apply(&self.frame, &mut self.perf, 57, BLOCK as f64 / FS);
-            // as the plugin does: a tilted head bends the pitch
-            self.perf.set_bend(self.follower.expression().bend);
+            // as the plugin does: the face's routing bends the pitch (head tilt, by default)
+            self.perf.set_bend(self.mods()[routes::PITCH]);
             let at = self.out.len();
             self.out.resize(at + BLOCK, 0.0);
             self.perf.render(&mut self.out[at..]);
@@ -147,6 +148,11 @@ impl Rig {
             self.frame.extra[*which] = *value;
         }
         self.run(seconds, true);
+    }
+
+    /// What the face does through the default routing now.
+    fn mods(&self) -> [f64; routes::NDST] {
+        self.follower.expression().mods(&routes::defaults())
     }
 
     fn tail(&self, seconds: f64) -> f64 {
@@ -257,17 +263,17 @@ fn the_rest_of_the_face_shapes_pitch_and_tone() {
     for mode in [Mode::Sing, Mode::Vowel, Mode::Creature] {
         let mut r = Rig::new(mode);
         r.detailed(0.5, 0.0, &[], 0.4);
-        let e = r.follower.expression();
-        assert!(e.bend.abs() < 1e-6 && e.bright.abs() < 1e-6, "a straight face changes the voice: {e:?}");
+        let m = r.mods();
+        assert!(m[routes::PITCH].abs() < 1e-6 && m[routes::BRIGHT].abs() < 1e-6, "a straight face changes the voice: {m:?}");
         // head tilted all the way, eyebrows up
         r.detailed(0.5, 0.0, &[(face::TILT, 1.0), (face::BROWS, 1.0)], 0.5);
-        let e = r.follower.expression();
-        assert!((e.bend - face::TILT_BEND).abs() < 0.05, "tilt bends by {}", e.bend);
-        assert!(e.bright > 0.3 && e.tension > 0.1, "raised eyebrows do not brighten: {e:?}");
+        let m = r.mods();
+        assert!((m[routes::PITCH] - face::TILT_BEND).abs() < 0.05, "tilt bends by {}", m[routes::PITCH]);
+        assert!(m[routes::BRIGHT] > 0.3 && m[routes::PRESSED] > 0.1, "raised eyebrows do not brighten: {m:?}");
         // the face goes: everything returns
         r.run(1.0, false);
-        let e = r.follower.expression();
-        assert!(e.bend.abs() < 0.01 && e.bright.abs() < 0.01 && (e.pressure - 1.0).abs() < 0.01, "{e:?}");
+        let (m, e) = (r.mods(), r.follower.expression());
+        assert!(m.iter().all(|v| v.abs() < 0.01) && (e.pressure - 1.0).abs() < 0.01, "{m:?} {e:?}");
     }
     // the tilt is heard: the same vowel is higher with the head tilted
     let pitch = |tilt: f32| {
@@ -292,4 +298,30 @@ fn an_old_tracker_still_plays() {
     assert_eq!(r.follower.expression(), face::Expression::default());
     r.mouth(0.0, 0.0, false, false, 0.5);
     assert!(r.tail(0.1) < 0.005);
+}
+
+#[test]
+fn the_routing_sends_any_part_of_the_face_anywhere() {
+    let mut r = Rig::new(Mode::Vowel);
+    r.detailed(0.5, 0.0, &[(face::JAW, 0.8), (face::TEETH, 0.6), (face::TILT, -0.5)], 0.6);
+    let e = r.follower.expression();
+    let near = |a: f64, b: f64| (a - b).abs() < 0.02;
+    assert!(near(e.sources[routes::JAW], 0.8) && near(e.sources[routes::TEETH], 0.6) && near(e.sources[routes::TILT], -0.5), "{e:?}");
+    // nothing routed: nothing moves
+    let off = [[0.0f32; routes::NDST]; routes::NSRC];
+    assert!(e.mods(&off).iter().all(|v| *v == 0.0));
+    // the jaw to Breathy at 50%, lip on teeth to Fry at -100%, head tilt to Vibrato at 25%
+    let mut table = off;
+    table[routes::JAW][routes::BREATHY] = 0.5;
+    table[routes::TEETH][routes::FRY] = -1.0;
+    table[routes::TILT][routes::VIBRATO] = 0.25;
+    let m = e.mods(&table);
+    assert!(near(m[routes::BREATHY], 0.4) && near(m[routes::FRY], -0.6), "{m:?}");
+    assert!((m[routes::VIBRATO] - 0.25 * -0.5 * 120.0).abs() < 1.0, "{m:?}");
+    assert!(m[routes::PITCH] == 0.0 && m[routes::BRIGHT] == 0.0);
+    // two signals on one setting add up
+    table[routes::OPEN][routes::BREATHY] = 0.5;
+    assert!(near(e.mods(&table)[routes::BREATHY], 0.4 + 0.25));
+    assert_eq!(routes::describe(routes::PITCH, 2.0 / 12.0), "+2.0 semitones");
+    assert_eq!(routes::describe(routes::BRIGHT, 0.35), "+35% of the knob's range");
 }

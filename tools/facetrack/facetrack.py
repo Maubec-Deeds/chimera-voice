@@ -11,8 +11,8 @@ It sends that to every Chimera Voice on this computer with its FACE switch on, o
 127.0.0.1 (nothing leaves the machine, and no images are saved).
 
 Keys in the tracker's window (they are also written in the window itself):
-  SPACE  guided calibration: four poses, SPACE to capture each, Esc to stop
-  R A U E  redo one pose: Rest, "Aah", "oo" (U), "Ee"
+  SPACE  guided calibration: five poses, SPACE to capture each, Esc to stop
+  R A U E F  redo one pose: Rest, "Aah", "oo" (U), "Ee", "ff" (lower lip on the teeth)
   1 2 3  send eyebrows / head tilt / smile to Chimera, or not
   V  video on/off (off saves processor time; the meters stay)
   Q  quit
@@ -40,6 +40,8 @@ CALIBRATION = os.path.join(HERE, "calibration.json")
 
 # landmark indices on MediaPipe's face mesh
 LIP_TOP, LIP_BOTTOM = 13, 14  # inner lips, centre
+LIP_TOP_OUT, LIP_BOTTOM_OUT = 0, 17  # outer edges of the lips, centre
+NOSE, CHIN = 1, 152  # nose tip and chin, for how far the jaw has dropped
 MOUTH_LEFT, MOUTH_RIGHT = 61, 291  # mouth corners
 FACE_LEFT, FACE_RIGHT = 234, 454  # cheeks, for scale
 EYE_LEFT, EYE_RIGHT = 33, 263  # outer eye corners, for the head's tilt
@@ -52,6 +54,10 @@ DEFAULT_CAL = {
     "gap_open": 0.16,
     # the jaw's own measure (0..1) on a wide "aah"
     "jaw_open": 0.6,
+    # nose tip to chin / face width at rest and on a wide "aah" (0 until calibrated: then the
+    # jaw is read from MediaPipe's jawOpen score instead, which mostly follows the lip gap)
+    "chin_rest": 0.0,
+    "chin_open": 0.0,
     # mouth width / face width for a rounded "oo" and a spread "ee"
     "width_round": 0.30,
     "width_spread": 0.48,
@@ -67,7 +73,12 @@ POSES = [
     ("a", "AAH", "Open wide and hold an \"aah\".", "the fully open mouth"),
     ("u", "OO", "Push your lips forward into a small \"oo\".", "rounded lips"),
     ("e", "EE", "Smile wide into an \"ee\".", "spread lips"),
+    ("f", "FF", "Rest your lower lip under your upper teeth, as for \"fff\".", "the lower lip on the teeth"),
 ]
+# what the "ff" pose is told apart by: each is compared between the rest pose and the "ff" pose,
+# and how far the face is along the way from one to the other is how much "lip on teeth" it is.
+# The second number brings each to a common scale (distances are small numbers).
+TEETH_SIGNS = [("roll_lower", 1.0), ("shrug_lower", 1.0), ("upper_up", 1.0), ("press", 1.0), ("stack", 12.0), ("gap", 12.0)]
 # head tilt: nothing inside the dead zone, full at FULL degrees
 TILT_DEAD, TILT_FULL = 4.0, 24.0
 
@@ -146,12 +157,16 @@ def clamp(x, lo=0.0, hi=1.0):
 def load_calibration():
     """The saved calibration, which poses have been done, and which expressions are sent."""
     cal = dict(DEFAULT_CAL)
+    cal["teeth_rest"], cal["teeth_pose"] = None, None
     done = set()
     send = {"brows": True, "tilt": True, "smile": True}
     try:
         with open(CALIBRATION, encoding="utf-8") as f:
             data = json.load(f)
-        cal.update({k: float(v) for k, v in data.items() if k in cal})
+        cal.update({k: float(v) for k, v in data.items() if k in DEFAULT_CAL})
+        for k in ("teeth_rest", "teeth_pose"):
+            if isinstance(data.get(k), dict):
+                cal[k] = {name: float(data[k].get(name, 0.0)) for name, _ in TEETH_SIGNS}
         if "done" in data:
             done = {str(k) for k in data["done"]} & {p[0] for p in POSES}
         else:
@@ -177,16 +192,22 @@ def save_calibration(cal, done, send):
 
 def capture(pose, raw, cal, done):
     """Take the pose the face is holding now as this calibration pose."""
+    signs = {name: raw[name] for name, _ in TEETH_SIGNS}
     if pose == "r":
         cal["gap_closed"] = raw["gap"]
+        cal["chin_rest"] = raw["chin"]
+        cal["teeth_rest"] = signs
         cal["brows_rest"], cal["smile_rest"], cal["tilt_rest"] = raw["brows"], raw["smile"], raw["tilt"]
     elif pose == "a":
         cal["gap_open"] = raw["gap"]
         cal["jaw_open"] = max(0.2, raw["jaw"])
+        cal["chin_open"] = raw["chin"]
     elif pose == "u":
         cal["width_round"] = raw["width"]
     elif pose == "e":
         cal["width_spread"] = raw["width"]
+    elif pose == "f":
+        cal["teeth_pose"] = signs
     done.add(pose)
 
 
@@ -202,6 +223,11 @@ def measure(lm, shapes, w, h):
         "gap": dist(LIP_TOP, LIP_BOTTOM) / scale,
         "width": dist(MOUTH_LEFT, MOUTH_RIGHT) / scale,
         "jaw": s("jawOpen"),
+        "chin": dist(NOSE, CHIN) / scale,
+        "stack": dist(LIP_TOP_OUT, LIP_BOTTOM_OUT) / scale,
+        "shrug_lower": s("mouthShrugLower"),
+        "upper_up": 0.5 * (s("mouthUpperUpLeft") + s("mouthUpperUpRight")),
+        "press": 0.5 * (s("mouthPressLeft") + s("mouthPressRight")),
         "pucker": s("mouthPucker") + 0.6 * s("mouthFunnel"),
         "brows": 0.5 * s("browInnerUp") + 0.25 * (s("browOuterUpLeft") + s("browOuterUpRight")) - 0.5 * (s("browDownLeft") + s("browDownRight")),
         "smile": 0.5 * (s("mouthSmileLeft") + s("mouthSmileRight")),
@@ -211,14 +237,36 @@ def measure(lm, shapes, w, h):
     }
 
 
+def teeth_score(raw, cal):
+    """How much the lower lip is on the teeth, 0..1. With the "ff" pose calibrated: how far the
+    face has moved from the rest pose toward the "ff" pose, less what it has moved in other
+    directions. Without it, a rough guess from the lower lip rolling in."""
+    rest, pose = cal.get("teeth_rest"), cal.get("teeth_pose")
+    if not rest or not pose:
+        by_gap = (raw["gap"] - cal["gap_closed"]) / max(1e-4, cal["gap_open"] - cal["gap_closed"])
+        return clamp((raw["roll_lower"] - raw["roll_upper"] - 0.25) / 0.35) * clamp(1.0 - by_gap / 0.35)
+    d = [(pose[k] - rest[k]) * w for k, w in TEETH_SIGNS]
+    x = [(raw[k] - rest[k]) * w for k, w in TEETH_SIGNS]
+    length2 = sum(v * v for v in d)
+    if length2 < 1e-4:
+        return 0.0  # the "ff" pose looked like the rest pose: nothing to go by
+    along = sum(a * b for a, b in zip(x, d)) / length2
+    off = math.sqrt(max(0.0, sum(v * v for v in x) - along * along * length2) / length2)
+    return clamp((along - 0.15) / 0.6) * clamp(1.0 - (off - 0.35) / 0.6)
+
+
 def features(raw, cal):
     """What Chimera is sent, from the raw measurements and the calibration. Everything is 0..1
     except rounding, brows and tilt, which are -1..1."""
     by_gap = (raw["gap"] - cal["gap_closed"]) / max(1e-4, cal["gap_open"] - cal["gap_closed"])
-    jaw = clamp(raw["jaw"] / max(0.05, cal["jaw_open"]))
-    # opening: the lip gap between the calibrated shut and wide-open mouths, with the jaw's own
-    # measure as a second opinion
-    opening = clamp(0.75 * by_gap + 0.25 * jaw)
+    if cal["chin_rest"] > 0 and cal["chin_open"] - cal["chin_rest"] > 0.02:
+        # the jaw: how far the chin has dropped from the nose, between rest and "aah". This moves
+        # with the jaw even when the lips stay shut or pursed, unlike the lip gap.
+        jaw = clamp((raw["chin"] - cal["chin_rest"]) / (cal["chin_open"] - cal["chin_rest"]))
+    else:
+        jaw = clamp(raw["jaw"] / max(0.05, cal["jaw_open"]))
+    # opening: the lip gap alone, between the calibrated shut and wide-open mouths
+    opening = clamp(by_gap)
     span = max(1e-4, cal["width_spread"] - cal["width_round"])
     spread01 = (raw["width"] - cal["width_round"]) / span  # 0 at "oo", 1 at "ee"
     # rounding: -1 spread ("ee") ... +1 rounded ("oo"), from the mouth's width and the pucker
@@ -228,7 +276,9 @@ def features(raw, cal):
     closed = clamp(1.0 - by_gap / 0.05)
     # the lower lip tucked under the upper teeth, as for "f" and "v": it rolls in while the
     # upper lip does not, and the mouth is nearly shut
-    teeth = clamp((raw["roll_lower"] - raw["roll_upper"] - 0.25) / 0.35) * clamp(1.0 - by_gap / 0.35)
+    teeth = teeth_score(raw, cal)
+    # a lip on the teeth also leaves no gap, but it is not a shut mouth ("m"), so it wins
+    closed *= 1.0 - teeth
     brows = clamp((raw["brows"] - cal["brows_rest"]) / 0.45, -1.0, 1.0)
     smile = clamp((raw["smile"] - cal["smile_rest"]) / 0.55)
     t = raw["tilt"] - cal["tilt_rest"]
@@ -321,6 +371,7 @@ def meter(img, x, y, w, label, value, color, centre=False):
 
 def draw_panel(width, f, face, is_open, syllables, fps, track_ms, done, send, wizard):
     """The panel under the video: status, what is being sent, and what the keys do."""
+    cal_teeth = "f" in done
     img = np.full((PANEL_H, width, 3), PANEL_BG, np.uint8)
     status = "TRACKING YOUR FACE" if face else "NO FACE: look at the camera and light your face"
     text(img, status, 10, 20, 0.5, GOOD if face else WARN)
@@ -334,7 +385,7 @@ def draw_panel(width, f, face, is_open, syllables, fps, track_ms, done, send, wi
     meter(img, col[1], 62, bar, "ee  <  lips  >  oo", f["rounding"], PINK, centre=True)
     meter(img, col[2], 62, bar, "jaw", f["jaw"], AMBER)
     meter(img, col[0], 92, bar, "lips shut  (m, b)", f["closed"], GOOD)
-    meter(img, col[1], 92, bar, "lip on teeth  (f, v)", f["teeth"], GOOD)
+    meter(img, col[1], 92, bar, "lip on teeth  (f, v)" + ("" if cal_teeth else "  - press F"), f["teeth"], GOOD)
     cv2.circle(img, (col[2] + 6, 94), 6, AMBER if is_open else (70, 60, 50), -1)
     text(img, f"note    syllables {syllables}", col[2] + 18, 99, 0.42, INK)
     for i, (key, name, label) in enumerate([("brows", "eyebrows", "1"), ("tilt", "head tilt", "2"), ("smile", "smile", "3")]):
@@ -355,12 +406,12 @@ def draw_panel(width, f, face, is_open, syllables, fps, track_ms, done, send, wi
         for key, name, _, _ in POSES:
             ok = key in done
             text(img, f"{name} {'ok' if ok else 'NOT YET'}", x, 162, 0.42, GOOD if ok else WARN)
-            x += 78 if ok else 118
+            x += 74 if ok else 100
         missing = len(POSES) - len(done)
         if missing:
             text(img, "Press SPACE to calibrate: it takes about 20 seconds and is saved.", 10, 184, 0.48, AMBER)
         else:
-            text(img, "SPACE calibrates again.  R, A, U, E redo one pose (Rest, Aah, oo, Ee).", 10, 184, 0.42, INK)
+            text(img, "SPACE calibrates again.  R A U E F redo one pose (Rest, Aah, oo, Ee, ff).", 10, 184, 0.42, INK)
         text(img, "1 2 3  send eyebrows / tilt / smile      V  video on or off      Q  quit", 10, 205, 0.42, DIM)
     return img
 

@@ -1,0 +1,41 @@
+CHIMERA VOICE  (Windows, 64-bit, CLAP)
+
+A singing, speaking and creature voice made by a simulated airway, plus an optional
+webcam face tracker that lets your mouth play it.
+
+
+INSTALL
+
+1. Close Bitwig.
+2. Double-click  Install.cmd  in this folder.
+3. Open Bitwig, rescan plugins (Settings > Locations > Rescan), and add "Chimera Voice"
+   to an instrument track.
+
+That's all for the plugin. Press F1 (or the ? button) in its window for a quick guide.
+
+
+FACE TRACKER (optional)
+
+1. Install Python 3.12 from https://www.python.org/downloads/ once.
+2. Start menu > "Chimera face tracker". The first start sets itself up (a few minutes,
+   about 300 MB) and downloads the face model.
+3. In the tracker's window press SPACE and follow the five poses to calibrate.
+4. In Chimera turn on FACE (top bar) and play a key once.
+
+The tracker sends to this computer only (127.0.0.1); no images are saved.
+
+
+UPDATING
+
+Download the newer zip and run its Install.cmd. Your face calibration is kept.
+
+
+UNINSTALLING
+
+Delete  %LOCALAPPDATA%\Programs\Common\CLAP\Chimera Voice.clap
+and the folder  %LOCALAPPDATA%\Programs\Chimera Voice
+and the Start menu shortcut "Chimera face tracker".
+
+
+The full manual is in the plugin (Full help) and in README.md on the project's GitHub page.
+Licences: see the "Licences" folder.

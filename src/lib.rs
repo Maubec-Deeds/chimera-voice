@@ -1,5 +1,5 @@
 //! Chimera Voice: the CHIMERA physical-modelling voice engine (https://github.com/jamesondh/chimera-vocal-synth,
-//! MIT, © Jameson Hodge) as a monophonic CLAP instrument.
+//! MIT, Â© Jameson Hodge) as a monophonic CLAP instrument.
 
 use chimera::anatomy::human::BodyMix;
 use chimera::voice::human_voice::VoiceTelemetry;
@@ -13,6 +13,7 @@ mod editor;
 pub mod face;
 pub mod lyrics;
 pub mod performer;
+pub mod routes;
 pub mod shared;
 
 use performer::{Built, KeyAction, Mode, Performer, Tone, CREATURE_KNOBS, PHRASES};
@@ -120,6 +121,9 @@ pub struct ChimeraParams {
     /// the eight phrases of lyrics
     #[persist = "phrases"]
     pub phrases: Arc<RwLock<Vec<String>>>,
+    /// which part of the face changes which setting, and by how much (see `routes`)
+    #[persist = "face-routes"]
+    pub face_routes: Arc<RwLock<routes::Routes>>,
 
     #[id = "mode"]
     pub mode: EnumParam<ModeParam>,
@@ -205,6 +209,7 @@ impl Default for ChimeraParams {
                 EguiState::from_size((editor::WIDTH as f32 * scale).round() as u32, (editor::HEIGHT as f32 * scale).round() as u32)
             },
             phrases: Arc::new(RwLock::new(phrases)),
+            face_routes: Arc::new(RwLock::new(routes::defaults())),
 
             mode: EnumParam::new("Mode", ModeParam::Sing),
             body: FloatParam::new("Body", 0.0, FloatRange::Linear { min: 0.0, max: 2.0 })
@@ -304,6 +309,9 @@ pub struct ChimeraVoice {
     phrase_seen: i32,
     bend: f64,
     mod_wheel: f64,
+    /// the face routing (a copy, refreshed each block) and what the face does through it now
+    routes: routes::Routes,
+    mods: [f64; routes::NDST],
 }
 
 impl Default for ChimeraVoice {
@@ -330,23 +338,53 @@ impl Default for ChimeraVoice {
             phrase_seen: 1,
             bend: 0.0,
             mod_wheel: 0.0,
+            routes: routes::defaults(),
+            mods: [0.0; routes::NDST],
         }
     }
 }
 
+/// The creature's first two knobs that are not its pitch: where CREATURE 1 and 2 of the face
+/// routing go.
+pub fn creature_free_knobs(def: &'static chimera::creatures::types::CreatureDef) -> [Option<usize>; 2] {
+    let mut free = performer::creature_knobs(def).enumerate().filter(|(_, (_, p))| p.role.is_none()).map(|(k, _)| k);
+    [free.next(), free.next()]
+}
+
 impl ChimeraVoice {
+    /// What the face adds to each knob now, for the editor (in the settings' own units; the
+    /// creature knobs normalized), and the face's signals for the routing screen.
+    fn publish_face(&self, leaned: &[f32; CREATURE_KNOBS]) {
+        let p = &self.params;
+        let shared = &self.shared;
+        let set = [0.0, p.breath.value() as f64, p.pressed.value() as f64, p.bright.value() as f64, p.breathy.value() as f64, p.rough.value() as f64, p.fry.value() as f64, p.vibrato.value() as f64 + 80.0 * self.mod_wheel];
+        let t = self.tone();
+        let used = [self.mods[routes::PITCH], t.pressure, t.tension, t.brightness, t.breathiness, t.roughness, t.fry, t.vibrato];
+        for (i, a) in shared.face_mods.iter().enumerate() {
+            let d = if i < used.len() { used[i] - set[i] } else { self.mods[i] };
+            a.store((d as f32).to_bits(), Ordering::Relaxed);
+        }
+        for (a, d) in shared.face_knobs.iter().zip(leaned) {
+            a.store(d.to_bits(), Ordering::Relaxed);
+        }
+        for (a, v) in shared.face_sources.iter().zip(self.face.expression().sources) {
+            a.store((v as f32).to_bits(), Ordering::Relaxed);
+        }
+    }
+
     fn tone(&self) -> Tone {
         let p = &self.params;
         // the face adds to the knobs while it is tracked (nothing otherwise)
         let e = self.face.expression();
+        let m = &self.mods;
         Tone {
-            pressure: (p.breath.value() as f64 * e.pressure).clamp(2.0, 26.0),
-            tension: (p.pressed.value() as f64 + e.tension).clamp(0.0, 1.0),
-            brightness: (p.bright.value() as f64 + e.bright).clamp(0.0, 1.0),
-            breathiness: p.breathy.value() as f64,
-            roughness: p.rough.value() as f64,
-            fry: p.fry.value() as f64,
-            vibrato: (p.vibrato.value() as f64 + 80.0 * self.mod_wheel).min(160.0),
+            pressure: (p.breath.value() as f64 * e.pressure + m[routes::BREATH]).clamp(2.0, 26.0),
+            tension: (p.pressed.value() as f64 + m[routes::PRESSED]).clamp(0.0, 1.0),
+            brightness: (p.bright.value() as f64 + m[routes::BRIGHT]).clamp(0.0, 1.0),
+            breathiness: (p.breathy.value() as f64 + m[routes::BREATHY]).clamp(0.0, 1.0),
+            roughness: (p.rough.value() as f64 + m[routes::ROUGH]).clamp(0.0, 1.0),
+            fry: (p.fry.value() as f64 + m[routes::FRY]).clamp(0.0, 1.0),
+            vibrato: (p.vibrato.value() as f64 + 80.0 * self.mod_wheel + m[routes::VIBRATO]).clamp(0.0, 160.0),
             vibrato_rate: p.vibrato_rate.value() as f64,
             glide: p.glide.value() as f64 / 1000.0,
             drift: p.drift.value() as f64,
@@ -373,7 +411,7 @@ impl ChimeraVoice {
             NoteEvent::NoteOff { note, .. } | NoteEvent::Choke { note, .. } => perf.note_off(note),
             NoteEvent::MidiPitchBend { value, .. } => {
                 self.bend = (value as f64 * 2.0 - 1.0) * self.params.bend_range.value() as f64;
-                perf.set_bend(self.bend + self.face.expression().bend);
+                perf.set_bend(self.bend + self.mods[routes::PITCH]);
             }
             NoteEvent::MidiCC { cc, value, .. } => match cc {
                 1 => self.mod_wheel = value as f64,
@@ -476,12 +514,17 @@ impl Plugin for ChimeraVoice {
         if self.mono.len() < n {
             self.mono.resize(n, 0.0); // a host breaking its promised maximum
         }
+        if let Some(r) = self.params.face_routes.try_read() {
+            self.routes = *r;
+        }
+        self.mods = self.face.expression().mods(&self.routes);
         let tone = self.tone();
         let shared = self.shared.clone();
         let playing = context.transport().playing;
         let want = self.spec();
 
         // ---- what the editor and the background task sent
+        let mut leaned = [0.0f32; CREATURE_KNOBS];
         {
             let perf = self.performer.as_mut().unwrap();
             if shared.lyrics_ready.load(Ordering::Acquire) {
@@ -526,20 +569,24 @@ impl Plugin for ChimeraVoice {
             } else {
                 self.face.release(perf);
             }
-            // a tilted head bends the pitch, on top of the wheel
-            let expression = self.face.expression();
-            perf.set_bend(self.bend + expression.bend);
+            // the face through its routing: the pitch on top of the wheel, the knobs (in tone())
+            self.mods = self.face.expression().mods(&self.routes);
+            perf.set_bend(self.bend + self.mods[routes::PITCH]);
             perf.set_key_action(self.params.keys.value().action());
             let mut knobs = [0.0; CREATURE_KNOBS];
             for (k, p) in knobs.iter_mut().zip(self.params.knobs.iter()) {
                 *k = p.value.value() as f64;
             }
-            // the eyebrows and the smile lean on the creature's first two knobs that are not its pitch
-            if expression.brows != 0.0 || expression.smile != 0.0 {
+            // CREATURE 1 and 2 in the routing are the creature's first two knobs that are not its pitch
+            let (c1, c2) = (self.mods[routes::CREATURE_1], self.mods[routes::CREATURE_2]);
+            if c1 != 0.0 || c2 != 0.0 {
                 let def = performer::creature(self.params.creature.value().index());
-                let free = performer::creature_knobs(def).enumerate().filter(|(_, (_, p))| p.role.is_none()).map(|(k, _)| k);
-                for (k, lean) in free.zip([0.3 * expression.brows, 0.3 * expression.smile]) {
-                    knobs[k] = (knobs[k] + lean).clamp(0.0, 1.0);
+                for (k, lean) in creature_free_knobs(def).into_iter().zip([c1, c2]) {
+                    if let Some(k) = k {
+                        let to = (knobs[k] + lean).clamp(0.0, 1.0);
+                        leaned[k] = (to - knobs[k]) as f32;
+                        knobs[k] = to;
+                    }
                 }
             }
             perf.set_knobs(&knobs);
@@ -630,6 +677,7 @@ impl Plugin for ChimeraVoice {
         }
 
         // ---- what the editor shows
+        self.publish_face(&leaned);
         let perf = self.performer.as_mut().unwrap();
         shared.phrase.store(perf.phrase() as i64, Ordering::Relaxed);
         shared.cursor.store(perf.cursor() as i64, Ordering::Relaxed);

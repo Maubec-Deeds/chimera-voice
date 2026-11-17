@@ -3,6 +3,7 @@
 
 use crate::performer::{self, nearest_pad_vowel, pad_position, HUM, PAD_VOWELS, PHRASES};
 use crate::shared::{Shared, TubeViz, SCOPE_LEN, TUBE_POINTS};
+use crate::routes::{self, Routes};
 use crate::{lyrics, ChimeraParams, CreatureParam, KeysParam, ModeParam};
 use chimera::phonetics::beatbox::BEAT_SOUNDS;
 use chimera::anatomy::geom::Vec2 as V2;
@@ -231,11 +232,24 @@ fn drag_param<P: Param>(ui: &egui::Ui, resp: &egui::Response, param: &P, setter:
 /// A rotary knob: drag up and down, Shift for fine, double-click for the default. `value`
 /// replaces the parameter's own text under the knob.
 fn knob<P: Param>(ui: &mut egui::Ui, center: Pos2, label: &str, param: &P, setter: &ParamSetter, color: Color32) {
-    knob_with(ui, center, label, param, setter, color, None, 64.0)
+    knob_with(ui, center, label, param, setter, color, None, 64.0, 0.0)
+}
+
+/// A knob the face can move: `face` is what the face adds now, in the parameter's own units,
+/// drawn as a lighter arc from the knob's value to the value in use.
+fn face_knob(ui: &mut egui::Ui, center: Pos2, label: &str, param: &FloatParam, setter: &ParamSetter, color: Color32, face: f32) {
+    let delta = param.preview_normalized(param.unmodulated_plain_value() + face) - param.unmodulated_normalized_value();
+    knob_with(ui, center, label, param, setter, color, None, 64.0, delta)
+}
+
+/// A colour halfway to white: the face's share of a knob.
+fn lighter(c: Color32) -> Color32 {
+    let l = |x: u8| x + ((255 - x) as f32 * 0.55) as u8;
+    Color32::from_rgb(l(c.r()), l(c.g()), l(c.b()))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn knob_with<P: Param>(ui: &mut egui::Ui, center: Pos2, label: &str, param: &P, setter: &ParamSetter, color: Color32, value: Option<String>, width: f32) {
+fn knob_with<P: Param>(ui: &mut egui::Ui, center: Pos2, label: &str, param: &P, setter: &ParamSetter, color: Color32, value: Option<String>, width: f32, face: f32) {
     let r = 19.0;
     let rect = Rect::from_center_size(center, vec2(width, 76.0));
     let id = ui.id().with(("knob", label, center.x as i32, center.y as i32));
@@ -256,6 +270,13 @@ fn knob_with<P: Param>(ui: &mut egui::Ui, center: Pos2, label: &str, param: &P, 
     p.add(Shape::line(arc(0.0, 1.0), Stroke::new(2.0_f32, FRAME)));
     if v > 0.001 {
         beam(p, arc(0.0, v), color, 2.2, if hot { 1.0 } else { 0.85 }, false);
+    }
+    // what the face adds (or takes away), and a dot at the value in use
+    let used = (v + face).clamp(0.0, 1.0);
+    if (used - v).abs() > 0.004 {
+        beam(p, arc(v.min(used), v.max(used)), lighter(color), 3.2, 0.95, false);
+        let a = ang(used);
+        p.circle_filled(pos2(c.x + r * a.cos(), c.y + r * a.sin()), 2.6, lighter(color));
     }
     let a = ang(v);
     p.line_segment([pos2(c.x + 7.0 * a.cos(), c.y + 7.0 * a.sin()), pos2(c.x + (r - 4.0) * a.cos(), c.y + (r - 4.0) * a.sin())], Stroke::new(2.0_f32, if hot { WHITE } else { color }));
@@ -391,6 +412,9 @@ struct State {
     face_packets: u32,
     face_last: Option<std::time::Instant>,
     face_seen: f64,
+    /// the face routing screen is open; the amount each cell had before it was clicked off
+    routing: bool,
+    route_memory: Routes,
 }
 
 impl State {
@@ -435,6 +459,8 @@ fn new_state(shared: &Shared) -> State {
         face_packets: 0,
         face_last: None,
         face_seen: f64::INFINITY,
+        routing: std::env::var("CHIMERA_UI_HELP").as_deref() == Ok("routing"),
+        route_memory: routes::defaults(),
     }
 }
 
@@ -566,6 +592,7 @@ fn keyboard(ctx: &egui::Context, st: &mut State) {
         st.f1_down = f1;
         if pressed(VK_ESCAPE) {
             st.help = Help::Closed;
+            st.routing = false;
         }
     }
 }
@@ -577,6 +604,7 @@ fn keyboard(ctx: &egui::Context, st: &mut State) {
     }
     if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
         st.help = Help::Closed;
+        st.routing = false;
     }
 }
 
@@ -587,7 +615,7 @@ const QUICK: &[(&str, Color32, &[&str])] = &[
     ("VOWEL", PINK, &["Keys sing the vowel under the pink handle. Drag it while you play."]),
     ("CREATURE", AMBER, &["Keys play an animal. Choose one in BESTIARY, and what the keys do under THE KEYS PLAY."]),
     ("BEATBOX", RED, &["Keys from C1 play mouth drums. Other keys hum a bass note. Click a pad to hear it."]),
-    ("FACE", GREEN, &["Turn on FACE and start the face tracker: your mouth, eyebrows and head tilt play the voice.", "See FACE CONTROL in the full help."]),
+    ("FACE", GREEN, &["Turn on FACE and start the face tracker: your mouth, eyebrows and head tilt play the voice.", "MAP chooses what each part of your face changes. See FACE CONTROL in the full help."]),
     ("SOUND", AMBER, &["BODY: man, woman or child. The knobs shape the voice. ECO halves the processor load.", "SILENCE stops everything."]),
     ("WINDOW", BLUE, &["Drag the bottom-right corner to resize the window."]),
 ];
@@ -609,6 +637,7 @@ const FULL: &[(&str, Color32, &[&str])] = &[
         &[
             "Click the large box under PHRASE and type the words. Each note sings the next syllable; the syllables appear as chips below the box. Amber is sounding, green sings next. Click a chip to start from it.",
             "While you type, the plugin has the keyboard. Click anywhere outside the box to give the keyboard back to your host (so the space bar starts playback again).",
+            "If your host keeps the space bar for itself (Bitwig does), type _ instead: an underscore counts as a space everywhere in the lyrics (hello_there).",
             "PASTE takes the text on the clipboard. LOAD FILE reads a text file.",
             "FROM THE TOP goes back to the first syllable. RESTART WHEN PLAY STARTS does that each time the host starts playing.",
             "Overlapping notes sing legato. The sustain pedal holds a note.",
@@ -643,15 +672,17 @@ const FULL: &[(&str, Color32, &[&str])] = &[
         &[
             "A webcam watches your face and Chimera follows it. Nothing leaves the computer and no pictures are saved.",
             "1. Turn on FACE in the top bar.",
-            "2. Start the tracker: double-click \"Start face tracker.cmd\" in the tools/facetrack folder of the Chimera project. The first run sets itself up, which takes a few minutes.",
-            "3. In the tracker's window press SPACE and follow the four poses (rest, \"aah\", \"oo\", \"ee\"). This is saved.",
+            "2. Start the tracker: Start menu > Chimera face tracker (installed by Install.cmd), or \"Start face tracker.cmd\" in the tools/facetrack folder of the Chimera project. The first run sets itself up, which takes a few minutes.",
+            "3. In the tracker's window press SPACE and follow the five poses (rest, \"aah\", \"oo\", \"ee\", and \"ff\" with your lower lip under your upper teeth). This is saved. R, A, U, E and F redo one pose.",
             "4. Play a key once: the face sings on the last key you played.",
             "The dot on the FACE button: green is tracking, amber means the tracker sees no face, blue means no tracker is running, red means another Chimera already has the tracker.",
             "What your face does:",
             "- VOWEL: your lips and jaw are the model's lips and jaw. Parting your lips starts the note, and the wider you open the louder it sings. Rounded lips sing \"oo\", spread lips \"ee\", and a smile moves the vowel forward. Shut your lips on a note and it hums \"m\"; a quick shut and open gives \"b\". Lower lip on your teeth gives \"v\". Lips kept shut end the note.",
             "- SING: each time your mouth opens it sings the next syllable of the lyrics. Opening wider sings louder. Shutting your mouth ends the note.",
             "- CREATURE: opening your mouth plays a held note, louder the wider it is. Eyebrows and smile lean on the creature's first two knobs.",
-            "- Everywhere: tilting your head bends the pitch up or down by up to two semitones. Raised eyebrows brighten and tighten the voice; lowered ones darken it.",
+            "- Everywhere: tilting your head bends the pitch up or down by up to two semitones. Raised eyebrows brighten and tighten the voice; lowered ones darken it; a smile brightens it.",
+            "FACE ROUTING (the MAP button next to FACE): a table with a row for each part of your face (open, jaw, round, spread, lip on teeth, smile, eyebrows, head tilt) and a column for each setting (pitch, BREATH, PRESSED, BRIGHT, BREATHY, ROUGH, FRY, VIBRATO, and the creature's first two knobs). Each cell is how much that part of the face moves that setting. Drag a cell up or down (Shift: fine; below zero turns the setting the other way), click it to switch it off or back on, double-click for its default. 100% moves a knob across its whole range; for pitch it is an octave. DEFAULTS brings back the settings described above; ALL OFF clears the table. It is saved with the project.",
+            "While the face moves a knob, the knob shows it as a lighter arc from its own value to the value in use.",
             "In the tracker's window, keys 1, 2 and 3 switch eyebrows, head tilt and smile off and on if you do not want them.",
             "A camera cannot see the tongue, so sounds made with it (t, d, s, l, k) cannot be read from the face. The voice trails your mouth by about a tenth of a second. Light your face well: a dim room slows the camera.",
         ],
@@ -775,6 +806,10 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         draw_help_screen(ui, full.shrink(m), st);
         return;
     }
+    if st.routing {
+        draw_routing(ui, full.shrink(m), params, shared, st);
+        return;
+    }
     if mode != ModeParam::Sing {
         st.typing = false;
     }
@@ -788,7 +823,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
     }
     let modes = [(ModeParam::Sing, "SING", GREEN), (ModeParam::Vowel, "VOWEL", PINK), (ModeParam::Creature, "CREATURE", AMBER), (ModeParam::Beatbox, "BEATBOX", RED)];
     for (i, (which, name, color)) in modes.into_iter().enumerate() {
-        let r = Rect::from_min_size(pos2(top.left() + 196.0 + 92.0 * i as f32, top.top() + 6.0), vec2(87.0, 28.0));
+        let r = Rect::from_min_size(pos2(top.left() + 196.0 + 88.0 * i as f32, top.top() + 6.0), vec2(84.0, 28.0));
         if toggle(ui, r, name, mode == which, color) {
             set(setter, &params.mode, which);
         }
@@ -796,12 +831,18 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
     if toggle(ui, Rect::from_min_size(pos2(top.right() - 84.0, top.top() + 6.0), vec2(84.0, 28.0)), "SILENCE", false, RED) {
         shared.panic.store(true, Ordering::Release);
     }
-    if toggle(ui, Rect::from_min_size(pos2(top.right() - 250.0, top.top() + 6.0), vec2(28.0, 28.0)), "?", false, WHITE) {
+    if toggle(ui, Rect::from_min_size(pos2(top.right() - 286.0, top.top() + 6.0), vec2(28.0, 28.0)), "?", false, WHITE) {
         st.help = Help::Quick;
     }
-    ui.interact(Rect::from_min_size(pos2(top.right() - 250.0, top.top() + 6.0), vec2(28.0, 28.0)), ui.id().with("help-tip"), Sense::hover()).on_hover_text("Quick guide (F1)");
+    ui.interact(Rect::from_min_size(pos2(top.right() - 286.0, top.top() + 6.0), vec2(28.0, 28.0)), ui.id().with("help-tip"), Sense::hover()).on_hover_text("Quick guide (F1)");
+    // the face routing: what each part of the face changes
+    let map_rect = Rect::from_min_size(pos2(top.right() - 190.0, top.top() + 6.0), vec2(36.0, 28.0));
+    if toggle(ui, map_rect, "MAP", false, GREEN) {
+        st.routing = true;
+    }
+    ui.interact(map_rect, ui.id().with("map-tip"), Sense::hover()).on_hover_text("Face routing: choose what each part of your face changes, and by how much");
     // follow a webcam face tracker (tools/facetrack); the dot says whether it is sending
-    let face_rect = Rect::from_min_size(pos2(top.right() - 216.0, top.top() + 6.0), vec2(58.0, 28.0));
+    let face_rect = Rect::from_min_size(pos2(top.right() - 252.0, top.top() + 6.0), vec2(58.0, 28.0));
     if toggle(ui, face_rect, "FACE", params.face.value(), GREEN) {
         set(setter, &params.face, !params.face.value());
     }
@@ -837,7 +878,7 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         let p = ui.painter();
         let singing = voicing > 0.2 && st.level > 0.003;
         let pitch = if singing { format!("{}  {:.0} Hz", note_name(f0), f0) } else { "--".to_string() };
-        p.text(pos2(top.right() - 260.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
+        p.text(pos2(top.right() - 296.0, top.center().y), Align2::RIGHT_CENTER, pitch, vfont(15.0), if singing { AMBER } else { BLUE_DIM });
     }
 
     // ---- left: the head or the creature's airway, then the body or the bestiary
@@ -984,7 +1025,8 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
             let v = performer::knob_value(p, param.unmodulated_normalized_value() as f64);
             let digits = p.digits.unwrap_or(if p.max - p.min > 50.0 { 0 } else { 2 }) as usize;
             let unit = p.unit.unwrap_or("").replace('₂', "2").replace('³', "3");
-            knob_with(ui, center, &knob_label(p.label), param, setter, colors[k % 4], Some(format!("{v:.digits$} {unit}")), 118.0);
+            let face = f32::from_bits(shared.face_knobs[k].load(Ordering::Relaxed));
+            knob_with(ui, center, &knob_label(p.label), param, setter, colors[k % 4], Some(format!("{v:.digits$} {unit}")), 118.0, face);
         }
     } else {
         let col = |i: usize| knob_rect.left() + 46.0 + 76.0 * i as f32;
@@ -992,13 +1034,14 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         p.text(pos2(knob_rect.left() + 12.0, knob_rect.top() + 9.0), Align2::LEFT_TOP, "VOICE", vfont(11.0), BLUE_MID);
         p.text(pos2(knob_rect.left() + 12.0, knob_rect.top() + 107.0), Align2::LEFT_TOP, "PITCH", vfont(11.0), BLUE_MID);
         p.line_segment([pos2(knob_rect.left() + 10.0, knob_rect.top() + 102.0), pos2(last_col - 50.0, knob_rect.top() + 102.0)], Stroke::new(1.0_f32, FRAME));
-        knob(ui, pos2(col(0), rows[0]), "BREATH", &params.breath, setter, AMBER);
-        knob(ui, pos2(col(1), rows[0]), "PRESSED", &params.pressed, setter, GREEN);
-        knob(ui, pos2(col(2), rows[0]), "BRIGHT", &params.bright, setter, GREEN);
-        knob(ui, pos2(col(3), rows[0]), "BREATHY", &params.breathy, setter, WHITE);
-        knob(ui, pos2(col(4), rows[0]), "ROUGH", &params.rough, setter, RED);
-        knob(ui, pos2(col(5), rows[0]), "FRY", &params.fry, setter, RED);
-        knob(ui, pos2(col(0), rows[1]), "VIBRATO", &params.vibrato, setter, PINK);
+        let fm = |i: usize| f32::from_bits(shared.face_mods[i].load(Ordering::Relaxed));
+        face_knob(ui, pos2(col(0), rows[0]), "BREATH", &params.breath, setter, AMBER, fm(routes::BREATH));
+        face_knob(ui, pos2(col(1), rows[0]), "PRESSED", &params.pressed, setter, GREEN, fm(routes::PRESSED));
+        face_knob(ui, pos2(col(2), rows[0]), "BRIGHT", &params.bright, setter, GREEN, fm(routes::BRIGHT));
+        face_knob(ui, pos2(col(3), rows[0]), "BREATHY", &params.breathy, setter, WHITE, fm(routes::BREATHY));
+        face_knob(ui, pos2(col(4), rows[0]), "ROUGH", &params.rough, setter, RED, fm(routes::ROUGH));
+        face_knob(ui, pos2(col(5), rows[0]), "FRY", &params.fry, setter, RED, fm(routes::FRY));
+        face_knob(ui, pos2(col(0), rows[1]), "VIBRATO", &params.vibrato, setter, PINK, fm(routes::VIBRATO));
         knob(ui, pos2(col(1), rows[1]), "RATE", &params.vibrato_rate, setter, PINK);
         knob(ui, pos2(col(2), rows[1]), "GLIDE", &params.glide, setter, BLUE);
         knob(ui, pos2(col(3), rows[1]), "DRIFT", &params.drift, setter, BLUE);
@@ -1014,6 +1057,142 @@ fn draw(ui: &mut egui::Ui, params: &ChimeraParams, shared: &Arc<Shared>, setter:
         let u = ((db + 50.0) / 50.0).clamp(0.0, 1.0);
         p.rect_filled(Rect::from_min_size(meter.min, vec2(meter.width() * u, meter.height())).shrink(1.5), 2.0, AMBER);
     }
+}
+
+/// The colour of each routing column: the colour of the knob it moves.
+const DEST_COLORS: [Color32; routes::NDST] = [BLUE, AMBER, GREEN, GREEN, WHITE, RED, RED, PINK, AMBER, AMBER];
+
+/// The face routing, over the whole window: one row per face signal, one column per setting,
+/// and in each cell how much that signal moves that setting.
+fn draw_routing(ui: &mut egui::Ui, rect: Rect, params: &ChimeraParams, shared: &Shared, st: &mut State) {
+    st.typing = false;
+    panel(ui.painter(), rect, "");
+    ui.painter().text(rect.left_top() + vec2(18.0, 24.0), Align2::LEFT_CENTER, "FACE ROUTING", vfont(20.0), BLUE);
+    if toggle(ui, Rect::from_min_size(pos2(rect.right() - 98.0, rect.top() + 11.0), vec2(84.0, 26.0)), "CLOSE", false, WHITE) {
+        st.routing = false;
+    }
+    if toggle(ui, Rect::from_min_size(pos2(rect.right() - 212.0, rect.top() + 11.0), vec2(104.0, 26.0)), "DEFAULTS", false, GREEN) {
+        *params.face_routes.write() = routes::defaults();
+    }
+    if toggle(ui, Rect::from_min_size(pos2(rect.right() - 326.0, rect.top() + 11.0), vec2(104.0, 26.0)), "ALL OFF", false, RED) {
+        let mut r = params.face_routes.write();
+        for (row, mem) in r.iter_mut().zip(st.route_memory.iter_mut()) {
+            for (a, m) in row.iter_mut().zip(mem.iter_mut()) {
+                if *a != 0.0 {
+                    *m = *a;
+                    *a = 0.0;
+                }
+            }
+        }
+    }
+    ui.painter().text(pos2(rect.right() - 340.0, rect.top() + 24.0), Align2::RIGHT_CENTER, "Esc closes", vfont(10.5), BLUE_DIM);
+    let intro = "Each cell sends one part of your face to one setting. Drag a cell up or down to set how much (minus turns it the other way); click it to switch it off or back on; double-click for its default. 100% moves a knob across its whole range (PITCH: an octave). The lighter arc on a knob shows what the face adds. Saved with the project.";
+    wrapped(ui, rect.left_top() + vec2(18.0, 46.0), rect.width() - 36.0, intro, 13.0, alpha(TEXT, 0.9));
+
+    let x0 = rect.left() + 18.0;
+    let name_w = 172.0;
+    let col_w = (rect.width() - 36.0 - name_w) / routes::NDST as f32;
+    let head_y = rect.top() + 122.0;
+    let row_h = 46.0;
+    let def = performer::creature(params.creature.value().index());
+    let free = crate::creature_free_knobs(def);
+    for (d, name) in routes::DESTS.iter().enumerate() {
+        let cx = x0 + name_w + col_w * (d as f32 + 0.5);
+        let size = if name.len() > 8 { 9.5 } else { 11.0 };
+        ui.painter().text(pos2(cx, head_y), Align2::CENTER_CENTER, *name, vfont(size), DEST_COLORS[d]);
+        let tip = match d {
+            routes::CREATURE_1 | routes::CREATURE_2 => {
+                let k = free[d - routes::CREATURE_1];
+                let knob = k.and_then(|k| performer::creature_knobs(def).nth(k)).map(|(_, p)| knob_label(p.label)).unwrap_or_else(|| "nothing".into());
+                format!("In Creature mode: the creature's knob {knob} (for the {}).", def.name)
+            }
+            routes::PITCH => "The pitch, on top of the pitch wheel. 100% is an octave.".to_string(),
+            routes::VIBRATO => "Vibrato depth, on top of the knob and the mod wheel. 100% is 120 cents.".to_string(),
+            _ => format!("The {} knob. 100% is its whole range.", name),
+        };
+        ui.interact(Rect::from_center_size(pos2(cx, head_y), vec2(col_w, 18.0)), ui.id().with(("route-head", d)), Sense::hover()).on_hover_text(tip);
+    }
+    let fine = ui.input(|i| i.modifiers.shift);
+    let mut routes_now = *params.face_routes.read();
+    let mut changed = false;
+    for (s, name) in routes::SOURCES.iter().enumerate() {
+        let y = head_y + 16.0 + row_h * s as f32;
+        let bipolar = s == routes::BROWS || s == routes::TILT;
+        let value = f32::from_bits(shared.face_sources[s].load(Ordering::Relaxed));
+        // the signal's name and what it reads now
+        let label = Rect::from_min_size(pos2(x0, y + 4.0), vec2(name_w - 16.0, row_h - 8.0));
+        ui.painter().text(label.left_top() + vec2(0.0, 4.0), Align2::LEFT_TOP, *name, vfont(12.0), TEXT);
+        let meter = Rect::from_min_size(pos2(label.left(), label.top() + 22.0), vec2(label.width() - 10.0, 7.0));
+        let p = ui.painter();
+        p.rect_stroke(meter, 2.0, Stroke::new(1.0_f32, FRAME), StrokeKind::Inside);
+        if bipolar {
+            let mid = meter.center().x;
+            let end = mid + meter.width() * 0.5 * value.clamp(-1.0, 1.0);
+            p.rect_filled(Rect::from_min_max(pos2(mid.min(end), meter.top() + 1.5), pos2(mid.max(end), meter.bottom() - 1.5)), 1.0, GREEN);
+            p.line_segment([pos2(mid, meter.top() - 2.0), pos2(mid, meter.bottom() + 2.0)], Stroke::new(1.0_f32, BLUE_MID));
+        } else {
+            p.rect_filled(Rect::from_min_size(meter.min, vec2(meter.width() * value.clamp(0.0, 1.0), meter.height())).shrink(1.5), 1.0, GREEN);
+        }
+        ui.interact(label, ui.id().with(("route-src", s)), Sense::hover()).on_hover_text(routes::SOURCE_TIPS[s]);
+
+        for d in 0..routes::NDST {
+            let cell = Rect::from_min_size(pos2(x0 + name_w + col_w * d as f32 + 3.0, y + 5.0), vec2(col_w - 6.0, row_h - 10.0));
+            let id = ui.id().with(("route", s, d));
+            let resp = ui.interact(cell, id, Sense::click_and_drag());
+            let amount = &mut routes_now[s][d];
+            let before = *amount;
+            if resp.dragged() {
+                let step = if fine { 0.001 } else { 0.005 };
+                *amount = (*amount - resp.drag_delta().y * step).clamp(-1.0, 1.0);
+            }
+            if resp.double_clicked() {
+                *amount = routes::defaults()[s][d];
+            } else if resp.clicked() {
+                if *amount != 0.0 {
+                    st.route_memory[s][d] = *amount;
+                    *amount = 0.0;
+                } else {
+                    let m = st.route_memory[s][d];
+                    *amount = if m != 0.0 { m } else { 0.25 };
+                }
+            }
+            if *amount != before {
+                changed = true;
+            }
+            let a = *amount;
+            let color = DEST_COLORS[d];
+            let hot = resp.hovered() || resp.dragged();
+            let live = (a * value).abs() > 0.02;
+            let p = ui.painter();
+            p.rect_filled(cell, 4.0, BG);
+            if a != 0.0 {
+                // filled in proportion: from the left for plus, from the right for minus
+                let inner = cell.shrink(2.0);
+                let w = inner.width() * a.abs();
+                let bar = if a > 0.0 { Rect::from_min_size(inner.min, vec2(w, inner.height())) } else { Rect::from_min_max(pos2(inner.right() - w, inner.top()), inner.max) };
+                p.rect_filled(bar, 3.0, alpha(color, if live { 0.45 } else { 0.25 }));
+            }
+            p.rect_stroke(cell, 4.0, Stroke::new(1.0_f32, if hot { WHITE } else if live { color } else if a != 0.0 { alpha(color, 0.6) } else { FRAME }), StrokeKind::Inside);
+            let text = if a == 0.0 { "-".to_string() } else { format!("{:+.0}%", a * 100.0) };
+            p.text(cell.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), if a == 0.0 { BLUE_DIM } else { TEXT });
+            if resp.hovered() && !resp.dragged() {
+                let effect = if a == 0.0 { "off".to_string() } else { format!("{} at full {}", routes::describe(d, a), name.to_lowercase()) };
+                resp.on_hover_text(format!("{} to {}: {effect}.\nDrag up or down to change (Shift: fine), click to switch off or on, double-click for the default.", name, routes::DESTS[d]));
+            }
+        }
+    }
+    if changed {
+        *params.face_routes.write() = routes_now;
+    }
+    let foot = rect.top() + 122.0 + 16.0 + row_h * routes::NSRC as f32 + 10.0;
+    wrapped(
+        ui,
+        pos2(x0, foot),
+        rect.width() - 36.0,
+        "Always on, whatever the table says: the mouth starts and ends notes, and in Vowel mode the jaw, lips and smile shape the vowel. The table adds to the knobs on top of that. The face tracker's own keys 1, 2 and 3 stop it sending eyebrows, head tilt or smile at all.",
+        12.0,
+        alpha(TEXT, 0.75),
+    );
 }
 
 /// A creature parameter's name as a knob label: capitals, no symbols the display font lacks.
@@ -1433,12 +1612,17 @@ mod tests {
         }
 
         fn run(&mut self, events: Vec<egui::Event>) {
+            let _ = self.run_shapes(events);
+        }
+
+        /// One frame, and what it painted.
+        fn run_shapes(&mut self, events: Vec<egui::Event>) -> Vec<egui::epaint::ClippedShape> {
             let size = vec2(WIDTH as f32 * self.scale, HEIGHT as f32 * self.scale);
             let raw = egui::RawInput { screen_rect: Some(Rect::from_min_size(Pos2::ZERO, size)), time: Some(self.time), events, focused: true, ..Default::default() };
             self.time += 1.0 / 60.0;
             let setter = ParamSetter::new(&self.host);
             let (params, shared, st) = (&self.params, &self.shared, &mut self.st);
-            let _ = self.ctx.run(raw, |ctx| frame(ctx, params, shared, &setter, st));
+            self.ctx.run(raw, |ctx| frame(ctx, params, shared, &setter, st)).shapes
         }
 
         /// Click at a place in the 960 x 640 design, wherever the window's size puts it.
@@ -1453,6 +1637,21 @@ mod tests {
             self.run(vec![]);
             self.run(vec![button(false)]);
             self.run(vec![]);
+        }
+
+        /// Drag from a place in the design by `dy` design pixels (down is positive).
+        fn drag(&mut self, x: f32, y: f32, dy: f32) {
+            let scale = self.scale;
+            let at = |y: f32| pos2(x * scale, y * scale);
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            self.run(vec![egui::Event::PointerMoved(at(y))]);
+            self.run(vec![button(at(y), true)]);
+            for k in 1..=10 {
+                self.run(vec![egui::Event::PointerMoved(at(y + dy * k as f32 / 10.0))]);
+            }
+            self.run(vec![button(at(y + dy), false)]);
+            self.run(vec![]);
+            self.time += 1.0;
         }
 
         fn type_text(&mut self, text: &str) {
@@ -1470,7 +1669,7 @@ mod tests {
             assert_eq!(r.host.set.lock().last().copied(), Some(1.0 / 3.0), "the VOWEL button did nothing at {scale}x");
             // the guide opens from its button and closes from its own
             assert!(r.st.help == Help::Closed);
-            r.click(712.0, 32.0);
+            r.click(676.0, 32.0);
             assert!(r.st.help == Help::Quick, "the ? button did not open the guide at {scale}x");
             r.click(772.0, 36.0);
             assert!(r.st.help == Help::Full, "FULL HELP did not open at {scale}x");
@@ -1494,6 +1693,58 @@ mod tests {
     }
 
     #[test]
+    fn the_face_routing_screen_changes_the_routing() {
+        for scale in [1.0, 0.6, 2.0] {
+            let mut r = Rig::new(scale);
+            assert!(!r.st.routing);
+            r.click(776.0, 32.0); // MAP
+            assert!(r.st.routing, "MAP did not open the routing at {scale}x");
+            // the cell for eyebrows (row 7) to breathy (column 5): off by default
+            let (x0, name_w, col_w) = (30.0, 172.0, (936.0 - 36.0 - 172.0) / 10.0);
+            let cell = |s: usize, d: usize| (x0 + name_w + col_w * (d as f32 + 0.5), 12.0 + 122.0 + 16.0 + 46.0 * s as f32 + 23.0);
+            let (x, y) = cell(routes::BROWS, routes::BREATHY);
+            assert_eq!(r.params.face_routes.read()[routes::BROWS][routes::BREATHY], 0.0);
+            r.drag(x, y, -60.0);
+            let a = r.params.face_routes.read()[routes::BROWS][routes::BREATHY];
+            assert!(a > 0.2, "dragging up did not raise the amount at {scale}x: {a}");
+            // a click switches it off, another brings the same amount back
+            r.click(x, y);
+            assert_eq!(r.params.face_routes.read()[routes::BROWS][routes::BREATHY], 0.0);
+            r.time += 1.0;
+            r.click(x, y);
+            assert_eq!(r.params.face_routes.read()[routes::BROWS][routes::BREATHY], a, "the click did not bring the amount back");
+            // a default cell switches off and back the same way
+            let (x, y) = cell(routes::TILT, routes::PITCH);
+            r.time += 1.0;
+            r.click(x, y);
+            assert_eq!(r.params.face_routes.read()[routes::TILT][routes::PITCH], 0.0, "head tilt to pitch did not switch off");
+            // DEFAULTS puts everything back; CLOSE closes
+            r.click(948.0 - 212.0 + 52.0, 36.0);
+            assert_eq!(*r.params.face_routes.read(), routes::defaults());
+            r.click(948.0 - 98.0 + 42.0, 36.0);
+            assert!(!r.st.routing, "CLOSE did not close the routing at {scale}x");
+        }
+    }
+
+    #[test]
+    fn a_knob_shows_what_the_face_adds() {
+        // the end of the face's arc is a small dot in the lighter colour
+        let dots = |shapes: &[egui::epaint::ClippedShape], color: Color32| {
+            shapes.iter().filter(|c| matches!(&c.shape, Shape::Circle(k) if k.fill == color && (k.radius - 2.6).abs() < 1e-3)).count()
+        };
+        let mut r = Rig::new(1.0);
+        let shapes = r.run_shapes(vec![]);
+        assert_eq!(dots(&shapes, lighter(AMBER)), 0, "a knob shows a face effect with no face");
+        // the face adds 6 cmH2O to Breath and takes 0.2 off Bright
+        r.shared.face_mods[routes::BREATH].store(6.0f32.to_bits(), Ordering::Relaxed);
+        r.shared.face_mods[routes::BRIGHT].store((-0.2f32).to_bits(), Ordering::Relaxed);
+        let shapes = r.run_shapes(vec![]);
+        assert_eq!(dots(&shapes, lighter(AMBER)), 1, "BREATH does not show the face's share");
+        assert_eq!(dots(&shapes, lighter(GREEN)), 1, "BRIGHT does not show the face taking some away");
+        // (the creature's knobs are drawn by the same code; this host cannot switch the mode)
+    }
+
+    #[test]
     fn every_mode_and_both_helps_draw_at_any_size() {
         // nothing panics and nothing is laid out for a window that is not there
         for scale in [0.6, 1.0, 2.5] {
@@ -1505,6 +1756,9 @@ mod tests {
                 r.st.help = help;
                 r.run(vec![]);
             }
+            r.st.routing = true;
+            r.run(vec![]);
+            r.st.routing = false;
         }
     }
 }

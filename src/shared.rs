@@ -105,6 +105,11 @@ pub struct Shared {
     /// by the background task, never on the audio thread)
     pub face: std::sync::Arc<crate::face::State>,
     pub face_listener: Mutex<Option<crate::face::Listener>>,
+    /// what the face adds now through its routing, for the editor: per routing column in the
+    /// setting's own units (f32 bits), per creature knob (normalized), and the face's signals
+    pub face_mods: [AtomicU32; crate::routes::NDST],
+    pub face_knobs: [AtomicU32; crate::performer::CREATURE_KNOBS],
+    pub face_sources: [AtomicU32; crate::routes::NSRC],
     pub viz: Mutex<Viz>,
     /// text a file dialog loaded, for the editor to take
     pub loaded_text: Mutex<Option<String>>,

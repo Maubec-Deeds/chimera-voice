@@ -7,6 +7,19 @@ vocal folds, throat, mouth, lips, nose); there are no samples.
 The engine is used unchanged, as a git submodule in `vendor/chimera-vocal-synth`. This project adds
 the plugin around it: note handling, parameters and the editor.
 
+## Download and install
+
+1. On the [Releases page](../../releases/latest), download `ChimeraVoice-<version>-windows-x64.zip`
+   and unzip it.
+2. Close Bitwig, then double-click **Install.cmd** in the unzipped folder. It puts the plugin where
+   CLAP hosts look and the face tracker in your Start menu ("Chimera face tracker").
+3. Open Bitwig, rescan plugins, and add **Chimera Voice** to an instrument track. Press F1 in its
+   window for a quick guide.
+
+The face tracker also needs Python 3.12 from [python.org](https://www.python.org/downloads/) the
+first time it starts. To update, run a newer zip's Install.cmd; the face calibration is kept.
+`READ ME FIRST.txt` in the zip says the same, plus how to uninstall. Nothing needs building.
+
 ## Playing it
 
 It is one voice (monophonic), with four modes.
@@ -21,8 +34,9 @@ Ways to get lyrics in:
 
 - **Type**: click the box and type. While you type the plugin holds the keyboard (the box has a
   green edge); click anywhere outside the box to hand it back to the host, so the space bar starts
-  playback again. English uses the CMU Pronouncing Dictionary; Korean (Hangul) and Russian also
-  work.
+  playback again. Some hosts (Bitwig among them) keep the space bar even then: type `_` instead,
+  which counts as a space everywhere in the lyrics (`hello_there`). English uses the CMU
+  Pronouncing Dictionary; Korean (Hangul) and Russian also work.
 - **Paste** takes the clipboard's text; **Load file** reads a text file.
 - **Eight phrases** (the numbered buttons), saved with the project. Pick the one to sing by
   clicking, by automating *Phrase*, or by playing a keyswitch: C0 to G0 (MIDI notes 24 to 31)
@@ -70,11 +84,15 @@ and smile. A camera cannot see the tongue, so sounds made with it (t, d, s, l, k
 from the face, and in Sing mode the words still come from the lyrics.
 
 1. Turn on **FACE** in the top bar.
-2. Double-click `tools/facetrack/Start face tracker.cmd`. The first run needs Python 3.12
-   (python.org) and sets itself up, which takes a few minutes and about 300 MB.
-3. Calibrate once: press **Space** in the tracker's window and follow the four poses it asks for
-   (rest, "aah", "oo", "ee"), pressing Space to capture each. This is saved for next time. The
-   window shows which poses are done; **R**, **A**, **U**, **E** redo one.
+2. Start the tracker: Start menu > **Chimera face tracker** (after installing from the zip), or
+   double-click `tools/facetrack/Start face tracker.cmd` in a copy of this project. The first run
+   needs Python 3.12 (python.org) and sets itself up, which takes a few minutes and about 300 MB.
+3. Calibrate once: press **Space** in the tracker's window and follow the five poses it asks for
+   (rest, "aah", "oo", "ee", and "ff" with the lower lip under the upper teeth), pressing Space to
+   capture each. This is saved for next time. The window shows which poses are done; **R**, **A**,
+   **U**, **E**, **F** redo one. The jaw is read from how far the chin drops (so it moves apart from
+   the lips once rest and "aah" are calibrated), and "lip on teeth" from how near the face is to
+   the "ff" pose.
 4. Play a key once: the face sings on the last key you played.
 
 What the face does:
@@ -89,9 +107,23 @@ What the face does:
   part way sings the next one legato; shutting the mouth ends the note. A wider mouth sings louder.
 - **Creature**: opening the mouth plays a held note, louder the wider it is. Eyebrows and smile
   lean on the creature's first two knobs that are not its pitch.
-- **Everywhere**: tilting your head bends the pitch by up to two semitones either way (nothing
-  within about four degrees of upright). Raised eyebrows brighten and tighten the voice, lowered
-  ones darken it; outside Vowel mode a smile brightens it too.
+- **Everywhere**, through the face routing below: tilting your head bends the pitch by up to two
+  semitones either way (nothing within about four degrees of upright); raised eyebrows brighten and
+  tighten the voice, lowered ones darken it; a smile brightens it.
+
+**Face routing.** The **MAP** button next to FACE opens a table: one row for each part of the face
+(open, jaw, round, spread, lip on teeth, smile, eyebrows, head tilt) and one column for each
+setting (pitch, Breath, Pressed, Bright, Breathy, Rough, Fry, Vibrato, and the creature's first two
+free knobs). Each cell is how much that part of the face moves that setting: drag it up or down
+(Shift for fine steps; below zero turns the setting the other way), click it to switch it off or
+back on, double-click for its default. 100% moves a knob across its whole range (pitch: an octave;
+vibrato: 120 cents). **DEFAULTS** brings back the routing described above, **ALL OFF** clears it.
+Each row shows what that part of the face reads now. The table is saved with the project. The
+mouth's own work (starting and ending notes, how loud, and in Vowel mode the vowel and the lips) is
+always on and is not in the table.
+
+While the face moves a knob, the knob shows it: a lighter arc from the knob's own value to the
+value in use, with a dot at the end.
 
 In the tracker's window, **1**, **2** and **3** switch eyebrows, head tilt and smile off and on,
 **V** hides the video to save processor time, and **Q** quits. The meters show everything being
@@ -143,7 +175,12 @@ cargo test --release # plays test phrases, creatures, drums and made-up face fra
 
 `target/release/chimera_voice_standalone.exe` runs the plugin on its own with the system's audio
 and MIDI devices. For checking the layout, the environment variables `CHIMERA_UI_SCALE` (0.6 to
-2.5) and `CHIMERA_UI_HELP` (`quick` or `full`) open it at another size or on a help screen.
+2.5) and `CHIMERA_UI_HELP` (`quick`, `full` or `routing`) open it at another size or on a help or
+routing screen.
+
+`./package.ps1` builds the release zip in `dist/`. Pushing a version tag (`git tag v0.4.0`,
+`git push origin v0.4.0`) has GitHub build the same zip and attach it to that tag's release; it can
+also be run by hand from the repository's Actions tab.
 
 ## Layout
 
@@ -154,9 +191,12 @@ and MIDI devices. For checking the layout, the environment variables `CHIMERA_UI
 - `src/editor.rs`: the editor (egui), drawn for 960 x 640 on a layer scaled to the window; the
   help screens; keyboard handling.
 - `src/face.rs`: the face tracker's packets, the listener, and how frames become notes, mouth
-  shapes and expression.
+  shapes and the signals the routing uses.
+- `src/routes.rs`: the face routing table and what it does to each setting.
 - `src/shared.rs`: what the audio thread, the editor and the background task share.
 - `tools/facetrack/`: the webcam tracker (Python, MediaPipe).
+- `packaging/`, `package.ps1`: the release zip and its installer.
+- `.github/workflows/release.yml`: builds the zip on GitHub for each version tag.
 
 ## Licences
 

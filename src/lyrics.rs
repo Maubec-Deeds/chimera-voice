@@ -147,11 +147,18 @@ fn code_run(run: &str, out: &mut Vec<Syllable>) {
     }
 }
 
+/// `_` counts as a space everywhere, for hosts that keep the space bar for themselves (Bitwig
+/// starts playback with it).
+fn spaced(text: &str) -> String {
+    text.replace('_', " ")
+}
+
 /// Lyrics → syllables. A lone `-` or `~` holds the vowel onto the next note; punctuation and line
 /// breaks end a phrase.
 pub fn parse(text: &str) -> Vec<Syllable> {
+    let text = spaced(text);
     let mut out = Vec::new();
-    for (kind, run) in runs(text) {
+    for (kind, run) in runs(&text) {
         match kind {
             Kind::Words => out.extend(lyrics_to_syllables(run, g2p())),
             Kind::Codes => code_run(run, &mut out),
@@ -164,8 +171,9 @@ pub fn parse(text: &str) -> Vec<Syllable> {
 /// What in the phonetic parts of the lyrics the voice will not say, one line per kind (empty when
 /// everything is sung).
 pub fn problems(text: &str) -> Vec<String> {
+    let text = spaced(text);
     let mut out = Vec::new();
-    for (kind, run) in runs(text) {
+    for (kind, run) in runs(&text) {
         match kind {
             Kind::Words => {}
             Kind::Ipa => out.extend(skipped_ipa(run).warnings()),

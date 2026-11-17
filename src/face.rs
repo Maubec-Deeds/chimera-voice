@@ -15,6 +15,7 @@
 //! block. Nothing here allocates on the audio thread.
 
 use crate::performer::{FaceMouth, Mode, Performer};
+use crate::routes;
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
@@ -216,29 +217,31 @@ pub fn pad_from_frame(f: &Frame) -> (f64, f64) {
     ((x - 0.22 * f.get(SMILE)).clamp(0.0, 1.0), y)
 }
 
-/// What the rest of the face adds to the voice's settings, whatever the mode.
+/// The face's signals for the routing table (see `routes`), smoothed, and what the mouth does to
+/// the breath on its own.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Expression {
-    /// head tilt: pitch bend (semitones)
-    pub bend: f64,
-    /// eyebrows (and, outside vowel mode, the smile): added to Bright
-    pub bright: f64,
-    /// eyebrows: added to Pressed
-    pub tension: f64,
     /// singing: the mouth's opening scales the lung pressure (1: no change)
     pub pressure: f64,
-    /// eyebrows (−1..1) and smile (0..1) themselves, for the creature's knobs
-    pub brows: f64,
-    pub smile: f64,
+    /// open, jaw, round, spread, lip on teeth, smile (0..1), eyebrows and head tilt (−1..1); all
+    /// 0 while no face is tracked
+    pub sources: [f64; routes::NSRC],
 }
 
 impl Default for Expression {
     fn default() -> Self {
-        Expression { bend: 0.0, bright: 0.0, tension: 0.0, pressure: 1.0, brows: 0.0, smile: 0.0 }
+        Expression { pressure: 1.0, sources: [0.0; routes::NSRC] }
     }
 }
 
-/// How far a full head tilt bends the pitch (semitones).
+impl Expression {
+    /// How much the face moves each setting through this routing (in the settings' own units).
+    pub fn mods(&self, routes: &routes::Routes) -> [f64; routes::NDST] {
+        routes::mods(routes, &self.sources)
+    }
+}
+
+/// How far a full head tilt bends the pitch with the default routing (semitones).
 pub const TILT_BEND: f64 = 2.0;
 
 /// Turns the tracker's frames into notes and mouth shapes, on the audio thread.
@@ -400,19 +403,14 @@ impl Follower {
         // ---- the rest of the face: pitch and tone, in every mode
         let mut want = Expression::default();
         if detail {
-            let (brows, smile) = (f.get(BROWS), f.get(SMILE));
-            want.bend = TILT_BEND * f.get(TILT);
-            // in vowel mode the smile moves the vowel instead
-            want.bright = 0.35 * brows + if mode == Mode::Vowel { 0.0 } else { 0.2 * smile };
-            want.tension = 0.15 * brows;
             if mode == Mode::Sing {
                 want.pressure = 0.8 + 0.45 * f.opening as f64;
             }
-            want.brows = brows;
-            want.smile = smile;
+            want.sources = [f.opening as f64, f.get(JAW), f.get(PUCKER), f.get(SPREAD), f.get(TEETH), f.get(SMILE), f.get(BROWS), f.get(TILT)];
         }
         let e = &mut self.expression;
-        for (now, to) in [(&mut e.bend, want.bend), (&mut e.bright, want.bright), (&mut e.tension, want.tension), (&mut e.pressure, want.pressure), (&mut e.brows, want.brows), (&mut e.smile, want.smile)] {
+        e.pressure += (want.pressure - e.pressure) * smooth;
+        for (now, to) in e.sources.iter_mut().zip(want.sources) {
             *now += (to - *now) * smooth;
         }
     }
